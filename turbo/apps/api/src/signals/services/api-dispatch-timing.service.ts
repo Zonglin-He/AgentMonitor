@@ -1,0 +1,281 @@
+import type { TriggerSource } from "@vm0/api-contracts/contracts/logs";
+
+import { now } from "../external/time";
+import { recordSandboxOperations } from "../external/sandbox-op-log";
+import { onRejection } from "../utils";
+
+type ApiDispatchTimingSpanKind = "top_level" | "nested";
+export type ApiDispatchTimingDimensions = Readonly<Record<string, string>>;
+export type ApiDispatchTimingDimensionsInput =
+  | ApiDispatchTimingDimensions
+  | (() => ApiDispatchTimingDimensions | undefined);
+
+export type ApiDispatchTimingActionType =
+  | "api_dispatch_pre_create_agent_run"
+  | "api_dispatch_pre_create_direct_parse_body"
+  | "api_dispatch_pre_create_direct_prepare_args"
+  | "api_dispatch_pre_create_zero_parse_body"
+  | "api_dispatch_pre_create_zero_prepare_args"
+  | "api_dispatch_pre_create_zero_entrypoint_gap"
+  | "api_dispatch_pre_create_zero_resolve_agent_id"
+  | "api_dispatch_pre_create_zero_load_agent"
+  | "api_dispatch_pre_create_zero_load_user_info"
+  | "api_dispatch_pre_create_zero_resolve_automation_context"
+  | "api_dispatch_pre_create_zero_load_connector_scopes"
+  | "api_dispatch_pre_create_zero_load_workflows"
+  | "api_dispatch_pre_create_zero_resolve_permission_policies"
+  | "api_dispatch_pre_create_zero_build_create_run_args"
+  | "api_dispatch_pre_create_zero_build_create_run_args_memory_runtime_injection"
+  | "api_dispatch_pre_create_zero_memory_document_search"
+  | "api_dispatch_pre_create_zero_memory_document_search_lexical"
+  | "api_dispatch_pre_create_zero_memory_document_search_semantic_embedding"
+  | "api_dispatch_pre_create_zero_memory_document_search_semantic_query"
+  | "api_dispatch_pre_create_zero_memory_document_search_hydrate"
+  | "api_dispatch_pre_create_zero_memory_profile_static"
+  | "api_dispatch_pre_create_zero_memory_profile_dynamic"
+  | "api_dispatch_pre_create_zero_memory_profile_search"
+  | "api_dispatch_pre_create_zero_memory_profile_search_exact_identity"
+  | "api_dispatch_pre_create_zero_memory_profile_search_semantic_embedding"
+  | "api_dispatch_pre_create_zero_memory_profile_search_semantic_query"
+  | "api_dispatch_pre_create_zero_memory_profile_search_graph_expansion"
+  | "api_dispatch_pre_create_zero_memory_profile_search_seed_rank"
+  | "api_dispatch_pre_create_zero_memory_profile_search_final_rank"
+  | "api_dispatch_pre_create_zero_memory_profile_hydrate"
+  | "api_dispatch_pre_create_zero_memory_profile_load_sources"
+  | "api_dispatch_pre_create_zero_web_chat_prepare_normal_send"
+  | "api_dispatch_pre_create_zero_web_chat_prepare_normal_send_load_and_authorize_agent"
+  | "api_dispatch_pre_create_zero_web_chat_prepare_normal_send_validate_model_selection"
+  | "api_dispatch_pre_create_zero_web_chat_prepare_normal_send_resolve_feature_switches"
+  | "api_dispatch_pre_create_zero_web_chat_prepare_normal_send_validate_codex_service_tier"
+  | "api_dispatch_pre_create_zero_web_chat_prepare_normal_send_resolve_initial_thread_model_pin"
+  | "api_dispatch_pre_create_zero_web_chat_prepare_normal_send_resolve_thread"
+  | "api_dispatch_pre_create_zero_web_chat_prepare_normal_send_prepare_recent_chat_context"
+  | "api_dispatch_pre_create_zero_web_chat_prepare_normal_send_persist_explicit_model_selection"
+  | "api_dispatch_pre_create_zero_web_chat_prepare_normal_send_persist_explicit_codex_service_tier"
+  | "api_dispatch_pre_create_zero_web_chat_prepare_normal_send_resolve_computer_use_host_grant"
+  | "api_dispatch_pre_create_zero_web_chat_resolve_client_message"
+  | "api_dispatch_pre_create_zero_web_chat_validate_revocation"
+  | "api_dispatch_pre_create_zero_web_chat_check_active_run"
+  | "api_dispatch_pre_create_zero_web_chat_queue_first_enqueue"
+  | "api_dispatch_pre_create_zero_web_chat_queue_first_check_dispatchable"
+  | "api_dispatch_pre_create_zero_web_chat_create_normal_run"
+  | "api_dispatch_pre_create_zero_web_chat_resolve_model_pin"
+  | "api_dispatch_pre_create_zero_web_chat_resolve_provider_admission"
+  | "api_dispatch_pre_create_zero_web_chat_build_create_run_args"
+  | "api_dispatch_pre_create_zero_slack_entrypoint_gap"
+  | "api_dispatch_pre_create_zero_slack_background_start_gap"
+  | "api_dispatch_pre_create_zero_slack_resolve_message"
+  | "api_dispatch_pre_create_zero_slack_record_memory_source"
+  | "api_dispatch_pre_create_zero_slack_set_thread_status"
+  | "api_dispatch_pre_create_zero_slack_build_run_params"
+  | "api_dispatch_pre_create_zero_slack_build_run_params_enrich_message"
+  | "api_dispatch_pre_create_zero_slack_build_run_params_resolve_model_route"
+  | "api_dispatch_pre_create_zero_slack_build_run_params_load_thread_binding"
+  | "api_dispatch_pre_create_zero_slack_build_run_params_resolve_session"
+  | "api_dispatch_pre_create_zero_slack_build_run_params_resolve_computer_use_host"
+  | "api_dispatch_pre_create_zero_slack_build_run_params_fetch_conversation_context"
+  | "api_dispatch_pre_create_zero_slack_build_run_params_fetch_conversation_context_replies"
+  | "api_dispatch_pre_create_zero_slack_build_run_params_fetch_conversation_context_history"
+  | "api_dispatch_pre_create_zero_slack_build_run_params_fetch_conversation_context_user_info"
+  | "api_dispatch_pre_create_zero_slack_build_run_params_fetch_conversation_context_format"
+  | "api_dispatch_pre_create_zero_slack_build_run_params_user_info_resolver"
+  | "api_dispatch_pre_create_zero_slack_build_run_params_assemble"
+  | "api_dispatch_pre_create_zero_slack_create_run"
+  | "api_dispatch_pre_create_zero_teams_entrypoint_gap"
+  | "api_dispatch_pre_create_zero_teams_create_run"
+  | "api_dispatch_pre_create_zero_workflow_automation_entrypoint_gap"
+  | "api_dispatch_pre_create_zero_workflow_automation_check_active_run"
+  | "api_dispatch_pre_create_zero_workflow_automation_check_target_access"
+  | "api_dispatch_pre_create_zero_workflow_automation_resolve_model_context"
+  | "api_dispatch_pre_create_zero_workflow_automation_build_run_input"
+  | "api_dispatch_pre_create_zero_workflow_automation_create_run"
+  | "api_dispatch_pre_create_zero_workflow_event_background_start_gap"
+  | "api_dispatch_pre_create_zero_workflow_event_load_source_state"
+  | "api_dispatch_pre_create_zero_workflow_event_load_external_events"
+  | "api_dispatch_pre_create_zero_workflow_event_load_automations"
+  | "api_dispatch_pre_create_zero_workflow_event_match_automations"
+  | "api_dispatch_pre_create_zero_workflow_event_record_processed_event"
+  | "api_dispatch_pre_create_zero_workflow_event_build_run_input"
+  | "api_dispatch_pre_create_zero_workflow_event_handoff_run"
+  | "api_dispatch_check_org_tier"
+  | "api_dispatch_check_run_admission"
+  | "api_dispatch_prepare_run_context"
+  | "api_dispatch_prepare_context_feature_switches"
+  | "api_dispatch_prepare_context_resolve_compose"
+  | "api_dispatch_prepare_context_load_persisted_environment"
+  | "api_dispatch_prepare_context_build_resolved_body"
+  | "api_dispatch_prepare_context_resolve_framework"
+  | "api_dispatch_prepare_context_resolve_connector_scope"
+  | "api_dispatch_prepare_context_resolve_model_provider"
+  | "api_dispatch_prepare_context_load_connector_contexts"
+  | "api_dispatch_prepare_context_load_stored_connectors"
+  | "api_dispatch_prepare_context_load_stored_connector_rows"
+  | "api_dispatch_prepare_context_filter_stored_connector_rows"
+  | "api_dispatch_prepare_context_load_stored_connector_secret_rows"
+  | "api_dispatch_prepare_context_decrypt_stored_connector_secrets"
+  | "api_dispatch_prepare_context_load_stored_connector_variable_rows"
+  | "api_dispatch_prepare_context_build_stored_connector_state"
+  | "api_dispatch_prepare_context_load_custom_connectors"
+  | "api_dispatch_prepare_context_load_custom_connector_rows"
+  | "api_dispatch_prepare_context_load_custom_connector_value_rows"
+  | "api_dispatch_prepare_context_build_custom_connector_firewalls"
+  | "api_dispatch_prepare_context_decrypt_custom_connector_values"
+  | "api_dispatch_prepare_context_render_custom_connector_auth_templates"
+  | "api_dispatch_prepare_context_render_custom_connector_prefixes"
+  | "api_dispatch_prepare_context_assemble_custom_connector_firewalls"
+  | "api_dispatch_prepare_context_build_permission_manifest"
+  | "api_dispatch_prepare_context_load_builtin_permission_indexes"
+  | "api_dispatch_prepare_context_apply_builtin_permission_policies"
+  | "api_dispatch_prepare_context_apply_custom_permission_policies"
+  | "api_dispatch_prepare_context_apply_model_provider_permission_policy"
+  | "api_dispatch_prepare_context_merge_permission_manifest"
+  | "api_dispatch_prepare_context_validate_environment"
+  | "api_dispatch_prepare_context_load_user_timezone"
+  | "api_dispatch_prepare_context_prepare_output_metadata"
+  | "api_dispatch_resolve_compose_by_compose_id"
+  | "api_dispatch_resolve_compose_by_version_id"
+  | "api_dispatch_resolve_compose_by_session_id"
+  | "api_dispatch_resolve_compose_by_checkpoint_id"
+  | "api_dispatch_resolve_compose_lookup_compose"
+  | "api_dispatch_resolve_compose_lookup_version"
+  | "api_dispatch_resolve_compose_lookup_session"
+  | "api_dispatch_resolve_compose_lookup_checkpoint"
+  | "api_dispatch_resolve_compose_load_resume_session"
+  | "api_dispatch_resolve_compose_resolve_session_history"
+  | "api_dispatch_resolve_compose_lookup_session_vars"
+  | "api_dispatch_check_vm0_credits"
+  | "api_dispatch_insert_run_with_concurrency"
+  | "api_dispatch_mark_pending_heartbeat"
+  | "api_dispatch_build_runner_job_payload"
+  | "api_dispatch_persist_runner_job_queue"
+  | "api_dispatch_lock_run_for_queue_persistence"
+  | "api_dispatch_persist_custom_connector_auth_refs"
+  | "api_dispatch_insert_runner_job_queue"
+  | "api_dispatch_update_run_runner_group"
+  | "api_dispatch_admission_lock_wait"
+  | "api_dispatch_check_concurrency_limit"
+  | "api_dispatch_concurrency_preflight_lock_wait"
+  | "api_dispatch_concurrency_preflight_check"
+  | "api_dispatch_insert_run_record"
+  | "api_dispatch_prepare_storage_manifest"
+  | "api_dispatch_prepare_storage_manifest_resolve_inputs"
+  | "api_dispatch_prepare_storage_manifest_ensure_artifacts"
+  | "api_dispatch_prepare_storage_manifest_ensure_artifact_lookup_storage"
+  | "api_dispatch_prepare_storage_manifest_ensure_artifact_insert_storage"
+  | "api_dispatch_prepare_storage_manifest_ensure_artifact_refetch_storage"
+  | "api_dispatch_prepare_storage_manifest_ensure_artifact_skip_initialized"
+  | "api_dispatch_prepare_storage_manifest_ensure_artifact_upload_empty_objects"
+  | "api_dispatch_prepare_storage_manifest_ensure_artifact_insert_initial_version"
+  | "api_dispatch_prepare_storage_manifest_load_storage_index"
+  | "api_dispatch_prepare_storage_manifest_build_entries"
+  | "api_dispatch_prepare_storage_manifest_build_compose_entries"
+  | "api_dispatch_prepare_storage_manifest_resolve_compose_versions"
+  | "api_dispatch_prepare_storage_manifest_generate_compose_urls"
+  | "api_dispatch_prepare_storage_manifest_build_additional_entries"
+  | "api_dispatch_prepare_storage_manifest_resolve_additional_versions"
+  | "api_dispatch_prepare_storage_manifest_generate_additional_urls"
+  | "api_dispatch_prepare_storage_manifest_build_artifact_entries"
+  | "api_dispatch_prepare_storage_manifest_resolve_artifact_versions"
+  | "api_dispatch_prepare_storage_manifest_generate_artifact_urls"
+  | "api_dispatch_prepare_storage_manifest_assemble"
+  | "api_dispatch_build_stored_execution_context";
+
+interface ApiDispatchTimingRecord {
+  readonly actionType: ApiDispatchTimingActionType;
+  readonly spanKind: ApiDispatchTimingSpanKind;
+  readonly durationMs: number;
+  readonly timestamp: string;
+  readonly dimensions?: ApiDispatchTimingDimensions;
+}
+
+export class ApiDispatchTimingCollector {
+  private readonly records: ApiDispatchTimingRecord[] = [];
+
+  recordElapsed(
+    actionType: ApiDispatchTimingActionType,
+    spanKind: ApiDispatchTimingSpanKind,
+    startedAt: number,
+    finishedAt: number = now(),
+    dimensions?: ApiDispatchTimingDimensionsInput,
+  ): void {
+    this.records.push({
+      actionType,
+      spanKind,
+      durationMs: Math.max(0, finishedAt - startedAt),
+      timestamp: new Date(finishedAt).toISOString(),
+      dimensions: resolveApiDispatchTimingDimensions(dimensions),
+    });
+  }
+
+  async measure<T>(
+    actionType: ApiDispatchTimingActionType,
+    spanKind: ApiDispatchTimingSpanKind,
+    operation: () => T | Promise<T>,
+    dimensions?: ApiDispatchTimingDimensionsInput,
+  ): Promise<T> {
+    const startedAt = now();
+    const result = await onRejection(
+      (async () => {
+        return await operation();
+      })(),
+      () => {
+        this.recordElapsed(actionType, spanKind, startedAt, now(), dimensions);
+      },
+    );
+    this.recordElapsed(actionType, spanKind, startedAt, now(), dimensions);
+    return result;
+  }
+
+  flush(args: {
+    readonly runId: string;
+    readonly runnerGroup: string;
+    readonly profile: string;
+    readonly dispatchPath: "direct";
+    readonly triggerSource?: TriggerSource;
+    readonly dimensions?: ApiDispatchTimingDimensions;
+  }): void {
+    const records = this.records.splice(0);
+    recordSandboxOperations(
+      records.map((record) => {
+        return {
+          sandboxType: "runner",
+          actionType: record.actionType,
+          durationMs: record.durationMs,
+          success: true,
+          runId: args.runId,
+          timestamp: record.timestamp,
+          dimensions: {
+            ...args.dimensions,
+            ...record.dimensions,
+            runner_group: args.runnerGroup,
+            profile: args.profile,
+            dispatch_path: args.dispatchPath,
+            span_kind: record.spanKind,
+            ...(args.triggerSource
+              ? { trigger_source: args.triggerSource }
+              : {}),
+          },
+        };
+      }),
+    );
+  }
+}
+
+export async function measureApiDispatchTiming<T>(
+  collector: ApiDispatchTimingCollector | undefined,
+  actionType: ApiDispatchTimingActionType,
+  spanKind: ApiDispatchTimingSpanKind,
+  operation: () => T | Promise<T>,
+  dimensions?: ApiDispatchTimingDimensionsInput,
+): Promise<T> {
+  if (!collector) {
+    return await operation();
+  }
+  return await collector.measure(actionType, spanKind, operation, dimensions);
+}
+
+function resolveApiDispatchTimingDimensions(
+  dimensions: ApiDispatchTimingDimensionsInput | undefined,
+): ApiDispatchTimingDimensions | undefined {
+  return typeof dimensions === "function" ? dimensions() : dimensions;
+}

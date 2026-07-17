@@ -1,0 +1,845 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { describe, expect, it } from "vitest";
+
+import {
+  elapsedSinceApiStartMs,
+  executionContextSchema,
+  heldSessionStateSchema,
+  jobSchema,
+  RUNNER_BUILTIN_FIREWALL_RESOLVE_NAMES_MAX,
+  SESSION_HISTORY_DOWNLOAD_SOURCE_CONFIGURED_PUBLIC_ENDPOINT,
+  RESUME_SESSION_HISTORY_MAX_BYTES,
+  resumeSessionSchema,
+  runnersBuiltinFirewallsResolveContract,
+  runnersJobClaimContract,
+  storageManifestSchema,
+  storedExecutionContextSchema,
+  storedResumeSessionSchema,
+} from "../runners";
+
+function loadRunnerClaimResponseFixture(): unknown {
+  return JSON.parse(
+    fs.readFileSync(
+      path.resolve(import.meta.dirname, "fixtures/runner-claim-response.json"),
+      "utf-8",
+    ),
+  );
+}
+
+describe("runner claim response contract", () => {
+  it("accepts the shared current response fixture", () => {
+    const context = executionContextSchema.parse(
+      loadRunnerClaimResponseFixture(),
+    );
+
+    expect(context).toMatchObject({
+      runId: "00000000-0000-4000-8000-000000020985",
+      agentComposeVersionId:
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      checkpointId: "11111111-1111-4111-8111-111111111111",
+      experimentalProfile: "vm0/default",
+      modelUsageProvider: "fixture-model",
+    });
+  });
+});
+
+describe("runner storage manifest contract", () => {
+  it("accepts the web-produced claim manifest shape", () => {
+    expect(
+      storageManifestSchema.parse({
+        storages: [
+          {
+            name: "workspace",
+            mountPath: "/workspace",
+            vasStorageName: "workspace-volume",
+            vasVersionId: "version-1",
+            archiveUrl: "https://storage.example/archive.tar.gz",
+          },
+        ],
+        artifacts: [
+          {
+            mountPath: "/home/user/.claude/projects/project",
+            vasStorageName: "memory",
+            vasStorageId: "storage-id-1",
+            vasVersionId: "version-2",
+            archiveUrl: "https://storage.example/artifact.tar.gz",
+          },
+        ],
+      }),
+    ).toEqual({
+      storages: [
+        {
+          name: "workspace",
+          mountPath: "/workspace",
+          vasStorageName: "workspace-volume",
+          vasVersionId: "version-1",
+          archiveUrl: "https://storage.example/archive.tar.gz",
+        },
+      ],
+      artifacts: [
+        {
+          mountPath: "/home/user/.claude/projects/project",
+          vasStorageName: "memory",
+          vasStorageId: "storage-id-1",
+          vasVersionId: "version-2",
+          archiveUrl: "https://storage.example/artifact.tar.gz",
+        },
+      ],
+    });
+  });
+
+  it("strips legacy artifact manifest urls", () => {
+    expect(
+      storageManifestSchema.parse({
+        storages: [],
+        artifacts: [
+          {
+            mountPath: "/home/user/.claude/projects/project",
+            vasStorageName: "memory",
+            vasStorageId: "storage-id-1",
+            vasVersionId: "version-2",
+            archiveUrl: "https://storage.example/artifact.tar.gz",
+            manifestUrl: "https://storage.example/manifest.json",
+          },
+        ],
+      }),
+    ).toEqual({
+      storages: [],
+      artifacts: [
+        {
+          mountPath: "/home/user/.claude/projects/project",
+          vasStorageName: "memory",
+          vasStorageId: "storage-id-1",
+          vasVersionId: "version-2",
+          archiveUrl: "https://storage.example/artifact.tar.gz",
+        },
+      ],
+    });
+  });
+
+  it("accepts explicit empty artifact entries with compatibility archive urls", () => {
+    const manifest = storageManifestSchema.parse({
+      storages: [],
+      artifacts: [
+        {
+          mountPath: "/home/user/.claude/projects/project",
+          vasStorageName: "memory",
+          vasStorageId: "storage-id-1",
+          vasVersionId: "version-2",
+          archiveUrl: "https://storage.example/artifact.tar.gz",
+          empty: true,
+        },
+      ],
+    });
+
+    expect(manifest.artifacts[0]).toMatchObject({
+      archiveUrl: "https://storage.example/artifact.tar.gz",
+      empty: true,
+    });
+  });
+
+  it("accepts explicit empty artifact entries without archive urls", () => {
+    const manifest = storageManifestSchema.parse({
+      storages: [],
+      artifacts: [
+        {
+          mountPath: "/home/user/.claude/projects/project",
+          vasStorageName: "memory",
+          vasStorageId: "storage-id-1",
+          vasVersionId: "version-2",
+          empty: true,
+        },
+      ],
+    });
+
+    expect(manifest.artifacts[0]).toMatchObject({
+      empty: true,
+    });
+    expect(manifest.artifacts[0]?.archiveUrl).toBeUndefined();
+  });
+
+  it("rejects non-empty artifact entries without archive urls", () => {
+    const result = storageManifestSchema.safeParse({
+      storages: [],
+      artifacts: [
+        {
+          mountPath: "/home/user/.claude/projects/project",
+          vasStorageName: "memory",
+          vasStorageId: "storage-id-1",
+          vasVersionId: "version-2",
+        },
+      ],
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects guest-download-only nullable archive urls", () => {
+    const result = storageManifestSchema.safeParse({
+      storages: [
+        {
+          name: "workspace",
+          mountPath: "/workspace",
+          vasStorageName: "workspace-volume",
+          vasVersionId: "version-1",
+          archiveUrl: null,
+        },
+      ],
+      artifacts: [],
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects nullable artifact archive urls even for explicit empty artifacts", () => {
+    const result = storageManifestSchema.safeParse({
+      storages: [],
+      artifacts: [
+        {
+          mountPath: "/home/user/.claude/projects/project",
+          vasStorageName: "memory",
+          vasStorageId: "storage-id-1",
+          vasVersionId: "version-2",
+          archiveUrl: null,
+          empty: true,
+        },
+      ],
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it("accepts preserve-parent missing-root policy on artifact entries", () => {
+    const manifest = storageManifestSchema.parse({
+      storages: [],
+      artifacts: [
+        {
+          mountPath: "/home/user/.claude/projects/-home-user-workspace/memory",
+          vasStorageName: "memory",
+          vasStorageId: "storage-id-1",
+          vasVersionId: "version-2",
+          archiveUrl: "https://storage.example/artifact.tar.gz",
+          missingRootPolicy: "preserveParentVersion",
+        },
+      ],
+    });
+
+    expect(manifest.artifacts[0]?.missingRootPolicy).toBe(
+      "preserveParentVersion",
+    );
+  });
+
+  it("accepts explicit fail missing-root policy on artifact entries", () => {
+    const manifest = storageManifestSchema.parse({
+      storages: [],
+      artifacts: [
+        {
+          mountPath: "/home/user/.claude/projects/-home-user-workspace/memory",
+          vasStorageName: "memory",
+          vasStorageId: "storage-id-1",
+          vasVersionId: "version-2",
+          archiveUrl: "https://storage.example/artifact.tar.gz",
+          missingRootPolicy: "fail",
+        },
+      ],
+    });
+
+    expect(manifest.artifacts[0]?.missingRootPolicy).toBe("fail");
+  });
+
+  it("rejects unknown artifact missing-root policies", () => {
+    const result = storageManifestSchema.safeParse({
+      storages: [],
+      artifacts: [
+        {
+          mountPath: "/home/user/.claude/projects/-home-user-workspace/memory",
+          vasStorageName: "memory",
+          vasStorageId: "storage-id-1",
+          vasVersionId: "version-2",
+          archiveUrl: "https://storage.example/artifact.tar.gz",
+          missingRootPolicy: "ignore",
+        },
+      ],
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it("strips runner-derived guest-download fields", () => {
+    const manifest = storageManifestSchema.parse({
+      storages: [
+        {
+          name: "workspace",
+          mountPath: "/workspace",
+          vasStorageName: "workspace-volume",
+          vasVersionId: "version-1",
+          archiveUrl: "https://storage.example/archive.tar.gz",
+          cached: true,
+        },
+      ],
+      artifacts: [],
+      cleanupPaths: ["/workspace"],
+    });
+
+    expect(manifest).toEqual({
+      storages: [
+        {
+          name: "workspace",
+          mountPath: "/workspace",
+          vasStorageName: "workspace-volume",
+          vasVersionId: "version-1",
+          archiveUrl: "https://storage.example/archive.tar.gz",
+        },
+      ],
+      artifacts: [],
+    });
+  });
+});
+
+describe("runner resume session contract", () => {
+  const historyHash =
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const historyGenerationRunId = "11111111-1111-4111-8111-111111111111";
+
+  it("accepts inline stored and claim resume sessions", () => {
+    const resumeSession = {
+      sessionId: "sess-123",
+      sessionHistory: '{"type":"init"}\n',
+    };
+
+    expect(storedResumeSessionSchema.safeParse(resumeSession).success).toBe(
+      true,
+    );
+    expect(resumeSessionSchema.safeParse(resumeSession).success).toBe(true);
+  });
+
+  it("accepts hash-backed stored resume sessions without URLs", () => {
+    const resumeSession = {
+      sessionId: "sess-123",
+      historyRef: { kind: "blob", hash: historyHash },
+    };
+
+    expect(storedResumeSessionSchema.parse(resumeSession)).toEqual(
+      resumeSession,
+    );
+    expect(
+      storedExecutionContextSchema.shape.resumeSession.safeParse(resumeSession)
+        .success,
+    ).toBe(true);
+  });
+
+  it("keeps generation metadata in stored and discovery shapes only", () => {
+    const historyGenerationAffinityProtectedUntil = "2026-07-15T00:00:00.500Z";
+    const storedResumeSession = {
+      sessionId: "sess-123",
+      historyGenerationRunId,
+      historyRef: { kind: "blob" as const, hash: historyHash },
+    };
+    expect(storedResumeSessionSchema.parse(storedResumeSession)).toEqual(
+      storedResumeSession,
+    );
+
+    const claimResumeSession = resumeSessionSchema.parse({
+      ...storedResumeSession,
+      historyRef: {
+        ...storedResumeSession.historyRef,
+        url: "https://r2.example.com/blobs/history.blob?sig=secret",
+        rawSize: 1024,
+        encodedSize: 1024,
+      },
+    });
+    expect(claimResumeSession).not.toHaveProperty("historyGenerationRunId");
+
+    const job = jobSchema.parse({
+      runId: "22222222-2222-4222-8222-222222222222",
+      prompt: "continue",
+      appendSystemPrompt: null,
+      agentComposeVersionId: null,
+      vars: null,
+      checkpointId: null,
+      historyGenerationRunId,
+      historyGenerationAffinityProtectedUntil,
+    });
+    expect(job.historyGenerationRunId).toBe(historyGenerationRunId);
+    expect(job.historyGenerationAffinityProtectedUntil).toBe(
+      historyGenerationAffinityProtectedUntil,
+    );
+
+    const heldSessionState = heldSessionStateSchema.parse({
+      sessionId: "sess-123",
+      lastCompletedAt: "2026-07-15T00:00:00.000Z",
+      reusableSandbox: {
+        profile: "vm0/default",
+        historyGenerationRunId,
+      },
+    });
+    expect(heldSessionState.reusableSandbox?.historyGenerationRunId).toBe(
+      historyGenerationRunId,
+    );
+  });
+
+  it("keeps generation-affinity additions optional for legacy runners", () => {
+    const job = jobSchema.parse({
+      runId: "22222222-2222-4222-8222-222222222222",
+      prompt: "continue",
+      appendSystemPrompt: null,
+      agentComposeVersionId: null,
+      vars: null,
+      checkpointId: null,
+      historyGenerationAffinityProtectedUntil: null,
+    });
+    expect(job.historyGenerationAffinityProtectedUntil).toBeNull();
+
+    const heldSessionState = heldSessionStateSchema.parse({
+      sessionId: "sess-legacy",
+      lastCompletedAt: "2026-07-15T00:00:00.000Z",
+      reusableSandbox: { profile: "vm0/default" },
+    });
+    expect(heldSessionState.reusableSandbox).toEqual({
+      profile: "vm0/default",
+    });
+  });
+
+  it("requires a URL for hash-backed claim resume sessions", () => {
+    const storedResumeSession = {
+      sessionId: "sess-123",
+      historyRef: { kind: "blob", hash: historyHash },
+    };
+    const claimResumeSession = {
+      sessionId: "sess-123",
+      historyRef: {
+        kind: "blob",
+        hash: historyHash,
+        url: "https://r2.example.com/blobs/history.blob?sig=secret",
+        rawSize: 1024,
+        encodedSize: 1024,
+      },
+    };
+
+    expect(resumeSessionSchema.safeParse(storedResumeSession).success).toBe(
+      false,
+    );
+    expect(resumeSessionSchema.parse(claimResumeSession)).toEqual(
+      claimResumeSession,
+    );
+    expect(
+      executionContextSchema.shape.resumeSession.safeParse(claimResumeSession)
+        .success,
+    ).toBe(true);
+  });
+
+  it("rejects non-lowercase session history hashes", () => {
+    const resumeSession = {
+      sessionId: "sess-123",
+      historyRef: { kind: "blob", hash: "A".repeat(64) },
+    };
+
+    expect(storedResumeSessionSchema.safeParse(resumeSession).success).toBe(
+      false,
+    );
+    expect(resumeSessionSchema.safeParse(resumeSession).success).toBe(false);
+  });
+
+  it("rejects oversized hash-backed claim resume sessions", () => {
+    const resumeSession = {
+      sessionId: "sess-123",
+      historyRef: {
+        kind: "blob",
+        hash: historyHash,
+        url: "https://r2.example.com/blobs/history.blob?sig=secret",
+        rawSize: RESUME_SESSION_HISTORY_MAX_BYTES + 1,
+        encodedSize: RESUME_SESSION_HISTORY_MAX_BYTES + 1,
+      },
+    };
+
+    expect(resumeSessionSchema.safeParse(resumeSession).success).toBe(false);
+  });
+
+  it("accepts gzip hash-backed claim resume sessions with explicit sizes", () => {
+    const resumeSession = {
+      sessionId: "sess-123",
+      historyRef: {
+        kind: "blob",
+        hash: historyHash,
+        url: "https://r2.example.com/blobs/history.blob.gz?sig=secret",
+        encoding: "gzip",
+        rawSize: 1024,
+        encodedSize: 128,
+        downloadSource:
+          SESSION_HISTORY_DOWNLOAD_SOURCE_CONFIGURED_PUBLIC_ENDPOINT,
+      },
+    };
+
+    expect(resumeSessionSchema.parse(resumeSession)).toEqual(resumeSession);
+  });
+
+  it("rejects unknown hash-backed claim resume session download sources", () => {
+    const resumeSession = {
+      sessionId: "sess-123",
+      historyRef: {
+        kind: "blob",
+        hash: historyHash,
+        url: "https://r2.example.com/blobs/history.blob?sig=secret",
+        rawSize: 1024,
+        encodedSize: 1024,
+        downloadSource: "regional_edge_cache",
+      },
+    };
+
+    expect(resumeSessionSchema.safeParse(resumeSession).success).toBe(false);
+  });
+
+  it("accepts zstd hash-backed stored and claim resume sessions", () => {
+    const storedResumeSession = {
+      sessionId: "sess-123",
+      historyRef: {
+        kind: "blob",
+        hash: historyHash,
+        encoding: "zstd",
+      },
+    };
+    const claimResumeSession = {
+      sessionId: "sess-123",
+      historyRef: {
+        kind: "blob",
+        hash: historyHash,
+        url: "https://r2.example.com/blobs/history.blob.zst?sig=secret",
+        encoding: "zstd",
+        rawSize: 1024,
+        encodedSize: 96,
+      },
+    };
+
+    expect(storedResumeSessionSchema.parse(storedResumeSession)).toEqual(
+      storedResumeSession,
+    );
+    expect(resumeSessionSchema.parse(claimResumeSession)).toEqual(
+      claimResumeSession,
+    );
+  });
+
+  it("rejects malformed gzip claim resume sessions", () => {
+    const resumeSession = {
+      sessionId: "sess-123",
+      historyRef: {
+        kind: "blob",
+        hash: historyHash,
+        url: "https://r2.example.com/blobs/history.blob.gz?sig=secret",
+        encoding: "gzip",
+      },
+    };
+
+    expect(resumeSessionSchema.safeParse(resumeSession).success).toBe(false);
+  });
+
+  it("rejects malformed zstd claim resume sessions", () => {
+    const resumeSession = {
+      sessionId: "sess-123",
+      historyRef: {
+        kind: "blob",
+        hash: historyHash,
+        url: "https://r2.example.com/blobs/history.blob.zst?sig=secret",
+        encoding: "zstd",
+      },
+    };
+
+    expect(resumeSessionSchema.safeParse(resumeSession).success).toBe(false);
+  });
+});
+
+describe("runner claim capability contract", () => {
+  it("accepts unknown capabilities for forward compatibility", () => {
+    const result = runnersJobClaimContract.claim.body.safeParse({
+      capabilities: ["futureCapability"],
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts optional direct candidate timing telemetry", () => {
+    const result = runnersJobClaimContract.claim.body.safeParse({
+      telemetry: {
+        discoverySource: "ably",
+        jobDiscoveredToClaimRequestMs: 123,
+        localAdmissionToClaimRequestMs: 4,
+        directCandidateNotificationToEnqueueMs: 1,
+        directCandidateInboxWaitMs: 2,
+        providerDiscoveryToMainLoopMs: 3,
+        mainLoopToLocalAdmissionMs: 4,
+        preLocalAdmissionOutcome: "local_holder",
+        sessionHistoryGenerationRelationship: "exact",
+      },
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it.each([
+    "parked_after_discovery",
+    "parked_before_discovery_lt_heartbeat_period",
+    "parked_before_discovery_ge_heartbeat_period",
+  ])("accepts %s generation local availability", (localAvailability) => {
+    const result = runnersJobClaimContract.claim.body.safeParse({
+      telemetry: {
+        sessionHistoryGenerationRelationship: "exact",
+        sessionHistoryGenerationLocalAvailability: localAvailability,
+      },
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects non-enum generation local availability", () => {
+    const result = runnersJobClaimContract.claim.body.safeParse({
+      telemetry: {
+        sessionHistoryGenerationRelationship: "exact",
+        sessionHistoryGenerationLocalAvailability: "parked_for_123_ms",
+      },
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it("accepts old claim bodies without generation telemetry", () => {
+    expect(runnersJobClaimContract.claim.body.safeParse({}).success).toBe(true);
+  });
+});
+
+describe("runner builtin firewall resolve contract", () => {
+  it("accepts omitted names for full catalog resolution", () => {
+    const result =
+      runnersBuiltinFirewallsResolveContract.resolve.body.safeParse({});
+
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts connector and model-provider names", () => {
+    const result =
+      runnersBuiltinFirewallsResolveContract.resolve.body.safeParse({
+        names: ["github", "model-provider:openai-api-key"],
+      });
+
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects malformed and oversized requests", () => {
+    expect(
+      runnersBuiltinFirewallsResolveContract.resolve.body.safeParse(null)
+        .success,
+    ).toBe(false);
+    expect(
+      runnersBuiltinFirewallsResolveContract.resolve.body.safeParse([]).success,
+    ).toBe(false);
+    expect(
+      runnersBuiltinFirewallsResolveContract.resolve.body.safeParse({
+        names: ["ModelProvider:openai-api-key"],
+      }).success,
+    ).toBe(false);
+    expect(
+      runnersBuiltinFirewallsResolveContract.resolve.body.safeParse({
+        names: ["model-provider:"],
+      }).success,
+    ).toBe(false);
+    expect(
+      runnersBuiltinFirewallsResolveContract.resolve.body.safeParse({
+        names: [],
+      }).success,
+    ).toBe(false);
+    expect(
+      runnersBuiltinFirewallsResolveContract.resolve.body.safeParse({
+        names: null,
+      }).success,
+    ).toBe(false);
+    expect(
+      runnersBuiltinFirewallsResolveContract.resolve.body.safeParse({
+        names: "github",
+      }).success,
+    ).toBe(false);
+    expect(
+      runnersBuiltinFirewallsResolveContract.resolve.body.safeParse({
+        names: [""],
+      }).success,
+    ).toBe(false);
+    expect(
+      runnersBuiltinFirewallsResolveContract.resolve.body.safeParse({
+        name: ["github"],
+      }).success,
+    ).toBe(false);
+    expect(
+      runnersBuiltinFirewallsResolveContract.resolve.body.safeParse({
+        names: ["github"],
+        extra: true,
+      }).success,
+    ).toBe(false);
+    expect(
+      runnersBuiltinFirewallsResolveContract.resolve.body.safeParse({
+        names: Array.from(
+          { length: RUNNER_BUILTIN_FIREWALL_RESOLVE_NAMES_MAX + 1 },
+          (_, index) => {
+            return `github-${index}`;
+          },
+        ),
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe("runner firewall entry contract", () => {
+  it("accepts compact builtin firewall entries", () => {
+    const firewalls = [
+      {
+        kind: "builtin",
+        name: "zendesk",
+        baseUrlVars: { ZENDESK_SUBDOMAIN: "acme" },
+      },
+    ];
+
+    expect(
+      storedExecutionContextSchema.shape.firewalls.safeParse(firewalls).success,
+    ).toBe(true);
+    expect(
+      executionContextSchema.shape.firewalls.safeParse(firewalls).success,
+    ).toBe(true);
+  });
+
+  it("accepts inline firewall entries", () => {
+    const firewalls = [
+      {
+        kind: "inline",
+        firewall: {
+          name: "internal-api",
+          apis: [
+            {
+              base: "https://api.internal.example.com",
+              auth: { headers: { Authorization: "${{ secrets.TOKEN }}" } },
+              permissions: [{ name: "read", rules: ["GET /items"] }],
+            },
+          ],
+        },
+      },
+    ];
+
+    expect(
+      storedExecutionContextSchema.shape.firewalls.safeParse(firewalls).success,
+    ).toBe(true);
+    expect(
+      executionContextSchema.shape.firewalls.safeParse(firewalls).success,
+    ).toBe(true);
+  });
+
+  it("rejects legacy expanded firewall entries in execution contexts", () => {
+    const firewalls = [
+      {
+        name: "github",
+        apis: [{ base: "https://api.github.com", auth: { headers: {} } }],
+      },
+    ];
+
+    expect(
+      storedExecutionContextSchema.shape.firewalls.safeParse(firewalls).success,
+    ).toBe(false);
+    expect(
+      executionContextSchema.shape.firewalls.safeParse(firewalls).success,
+    ).toBe(false);
+  });
+
+  it("rejects unsupported execution firewall kinds", () => {
+    const firewalls = [
+      {
+        kind: "unknown",
+        name: "github",
+        apis: [{ base: "https://api.github.com", auth: { headers: {} } }],
+      },
+    ];
+
+    expect(
+      storedExecutionContextSchema.shape.firewalls.safeParse(firewalls).success,
+    ).toBe(false);
+    expect(
+      executionContextSchema.shape.firewalls.safeParse(firewalls).success,
+    ).toBe(false);
+  });
+});
+
+describe("runner apiStartTime contract", () => {
+  it("accepts Unix epoch millisecond integers", () => {
+    const timestamp = 1_700_000_000_000;
+
+    expect(
+      storedExecutionContextSchema.shape.apiStartTime.safeParse(timestamp)
+        .success,
+    ).toBe(true);
+    expect(
+      executionContextSchema.shape.apiStartTime.safeParse(timestamp).success,
+    ).toBe(true);
+  });
+
+  it("rejects fractional timestamps", () => {
+    const timestamp = 1_700_000_000_000.5;
+
+    expect(
+      storedExecutionContextSchema.shape.apiStartTime.safeParse(timestamp)
+        .success,
+    ).toBe(false);
+    expect(
+      executionContextSchema.shape.apiStartTime.safeParse(timestamp).success,
+    ).toBe(false);
+  });
+
+  it("rejects negative timestamps", () => {
+    expect(
+      storedExecutionContextSchema.shape.apiStartTime.safeParse(-1).success,
+    ).toBe(false);
+    expect(
+      executionContextSchema.shape.apiStartTime.safeParse(-1).success,
+    ).toBe(false);
+  });
+
+  it("rejects seconds-shaped timestamps", () => {
+    const timestamp = 1_700_000_000;
+
+    expect(
+      storedExecutionContextSchema.shape.apiStartTime.safeParse(timestamp)
+        .success,
+    ).toBe(false);
+    expect(
+      executionContextSchema.shape.apiStartTime.safeParse(timestamp).success,
+    ).toBe(false);
+  });
+
+  it("computes elapsed milliseconds for valid apiStartTime values", () => {
+    expect(elapsedSinceApiStartMs(1_700_000_000_000, 1_700_000_001_250)).toBe(
+      1_250,
+    );
+  });
+
+  it("clamps future apiStartTime values to zero elapsed milliseconds", () => {
+    expect(elapsedSinceApiStartMs(1_700_000_001_250, 1_700_000_000_000)).toBe(
+      0,
+    );
+  });
+
+  it("skips seconds-shaped apiStartTime values", () => {
+    expect(elapsedSinceApiStartMs(1_700_000_000, 1_700_000_001_250)).toBe(
+      undefined,
+    );
+  });
+
+  it("skips fractional apiStartTime values", () => {
+    expect(elapsedSinceApiStartMs(1_700_000_000_000.5, 1_700_000_001_250)).toBe(
+      undefined,
+    );
+  });
+});
+
+describe("runner Claude tool list contracts", () => {
+  it("keeps runner context schemas tolerant of legacy tool list values", () => {
+    expect(
+      storedExecutionContextSchema.shape.tools.safeParse(["Bash,Read"]).success,
+    ).toBe(true);
+    expect(
+      executionContextSchema.shape.tools.safeParse(["Bash,Read"]).success,
+    ).toBe(true);
+  });
+});

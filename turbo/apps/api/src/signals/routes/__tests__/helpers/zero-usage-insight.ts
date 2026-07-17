@@ -1,0 +1,201 @@
+import { command } from "ccstate";
+import type {
+  TestUsageInsightStateActionBody,
+  TestUsageInsightStateActionResponse,
+  TestUsageInsightStateFixture,
+} from "@vm0/api-contracts/contracts/test-usage-insight-state";
+
+import { createAppWithRoutes } from "../../../../app-factory-core";
+import { testUsageInsightStateRoutes } from "../../test-usage-insight-state";
+
+const USAGE_INSIGHT_STATE_ROUTE = "/api/test/usage-insight-state";
+
+export interface UsageInsightFixture {
+  readonly orgId: string;
+  readonly userId: string;
+}
+
+interface ComposeResult {
+  readonly composeId: string;
+  readonly agentId: string;
+}
+
+interface SeedRunArgs {
+  readonly orgId: string;
+  readonly userId: string;
+  readonly composeId: string;
+  readonly triggerSource?: string;
+  readonly chatThreadId?: string;
+  readonly status?: string;
+  readonly prompt?: string;
+  readonly createdAt?: Date;
+  readonly startedAt?: Date | null;
+  readonly completedAt?: Date | null;
+  readonly continuedFromSessionId?: string | null;
+  readonly sandboxReuseResult?: string | null;
+  readonly result?: Record<string, unknown> | null;
+  readonly error?: string | null;
+  readonly lastEventSequence?: number | null;
+  readonly selectedModel?: string | null;
+}
+
+function requestUsageInsightState(
+  signal: AbortSignal,
+  path: string,
+  init?: RequestInit,
+): Promise<Response> {
+  const app = createAppWithRoutes({
+    signal,
+    routes: testUsageInsightStateRoutes,
+  });
+  return Promise.resolve(app.request(path, init));
+}
+
+function dateToWire(value: Date | null | undefined): string | null | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === null) {
+    return null;
+  }
+  return value.toISOString();
+}
+
+function fixtureFromWire(
+  fixture: TestUsageInsightStateFixture,
+): UsageInsightFixture {
+  return {
+    orgId: fixture.org_id,
+    userId: fixture.user_id,
+  };
+}
+
+function fixtureToWire(
+  fixture: UsageInsightFixture,
+): TestUsageInsightStateFixture {
+  return {
+    org_id: fixture.orgId,
+    user_id: fixture.userId,
+  };
+}
+
+async function readJson<T>(response: Response): Promise<T> {
+  return (await response.json()) as T;
+}
+
+function expectOk(response: Response, operation: string): void {
+  if (response.ok) {
+    return;
+  }
+  throw new Error(`${operation} failed with ${response.status}`);
+}
+
+async function postAction(
+  signal: AbortSignal,
+  body: TestUsageInsightStateActionBody,
+): Promise<TestUsageInsightStateActionResponse> {
+  const response = await requestUsageInsightState(
+    signal,
+    `${USAGE_INSIGHT_STATE_ROUTE}/action`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  signal.throwIfAborted();
+  await expectOk(response, `usage insight action ${body.action}`);
+  signal.throwIfAborted();
+  const result = await readJson<TestUsageInsightStateActionResponse>(response);
+  signal.throwIfAborted();
+  return result;
+}
+
+export const seedUsageInsightFixture$ = command(
+  async (
+    _,
+    _input: void,
+    signal: AbortSignal,
+  ): Promise<UsageInsightFixture> => {
+    const response = await postAction(signal, { action: "seed-fixture" });
+    if (!response.fixture) {
+      throw new Error("seedUsageInsightFixture$: response missing fixture");
+    }
+    return fixtureFromWire(response.fixture);
+  },
+);
+
+export const deleteUsageInsightFixture$ = command(
+  async (
+    _,
+    fixture: UsageInsightFixture,
+    signal: AbortSignal,
+  ): Promise<void> => {
+    await postAction(signal, {
+      action: "delete-fixture",
+      fixture: fixtureToWire(fixture),
+    });
+  },
+);
+
+export const seedCompose$ = command(
+  async (
+    _,
+    args: {
+      orgId: string;
+      userId: string;
+      name?: string;
+      displayName?: string | null;
+      visibility?: "public" | "private";
+    },
+    signal: AbortSignal,
+  ): Promise<ComposeResult> => {
+    const response = await postAction(signal, {
+      action: "seed-compose",
+      org_id: args.orgId,
+      user_id: args.userId,
+      name: args.name,
+      display_name: args.displayName,
+      visibility: args.visibility,
+    });
+    if (!response.compose_id || !response.agent_id) {
+      throw new Error("seedCompose$: response missing compose identifiers");
+    }
+    return {
+      composeId: response.compose_id,
+      agentId: response.agent_id,
+    };
+  },
+);
+
+export const seedRun$ = command(
+  async (
+    _,
+    args: SeedRunArgs,
+    signal: AbortSignal,
+  ): Promise<{ runId: string }> => {
+    const response = await postAction(signal, {
+      action: "seed-run",
+      org_id: args.orgId,
+      user_id: args.userId,
+      compose_id: args.composeId,
+      trigger_source: args.triggerSource,
+      chat_thread_id: args.chatThreadId,
+      status: args.status,
+      prompt: args.prompt,
+      created_at: dateToWire(args.createdAt) ?? undefined,
+      started_at: dateToWire(args.startedAt),
+      completed_at: dateToWire(args.completedAt),
+      continued_from_session_id: args.continuedFromSessionId,
+      sandbox_reuse_result: args.sandboxReuseResult,
+      result: args.result,
+      error: args.error,
+      last_event_sequence: args.lastEventSequence,
+      selected_model: args.selectedModel,
+    });
+    if (!response.run_id) {
+      throw new Error("seedRun$: response missing run_id");
+    }
+    return { runId: response.run_id };
+  },
+);

@@ -1,0 +1,596 @@
+import { randomBytes } from "node:crypto";
+
+import { agentRuns } from "@vm0/db/schema/agent-run";
+import { zeroRuns } from "@vm0/db/schema/zero-run";
+import { command } from "ccstate";
+import { and, desc, eq, inArray, isNotNull } from "drizzle-orm";
+
+import { logger } from "../../lib/log";
+import { writeDb$, type Db } from "../external/db";
+import { now } from "../external/time";
+import type { DispatchFailedRunCallbacks } from "./agent-run-create.service";
+import type { InternalRunCallbackKind } from "./internal-run-callback";
+import {
+  postRunUserMessage,
+  resolveRunChatThreadModelPin,
+} from "./zero-chat-run-message.service";
+import { hasUnclaimedQueuedUserMessage } from "./zero-chat-queued-message.service";
+import {
+  pauseActiveGoalForThread,
+  loadActiveGoalForThread,
+  type GoalBootstrap,
+} from "./zero-goal.service";
+import {
+  DEFAULT_GOAL_OBJECTIVE_BRIEF,
+  normalizeGoalObjectiveBrief,
+} from "./zero-goal-objective-brief-normalization.service";
+import {
+  resolveModelFirstProviderAdmission,
+  type ModelFirstPin,
+} from "./zero-model-selection.service";
+import { createZeroRun$ } from "./zero-runs-create.service";
+
+const log = logger("api:zero-goal-continuation");
+
+const ACTIVE_RUN_STATUSES = ["queued", "pending", "running"] as const;
+
+type TerminalRunStatus = "completed" | "failed" | "timeout" | "cancelled";
+
+interface TerminatingRunContext {
+  readonly runId: string;
+  readonly status: string;
+  readonly orgId: string;
+  readonly userId: string;
+  readonly chatThreadId: string | null;
+}
+
+type GoalContinuationResult =
+  | { readonly kind: "skipped"; readonly reason: string }
+  | { readonly kind: "continued"; readonly runId: string }
+  | { readonly kind: "paused"; readonly goalId: string }
+  | {
+      readonly kind: "failed-to-enqueue";
+      readonly goalId: string;
+      readonly error: string;
+    };
+
+type RunGoalResult =
+  | { readonly kind: "ok"; readonly runId: string }
+  | { readonly kind: "conflict"; readonly message: string }
+  | {
+      readonly kind: "run_error";
+      readonly response: {
+        readonly status: number;
+        readonly body: {
+          readonly error: { readonly message: string; readonly code: string };
+        };
+      };
+    };
+
+interface InternalRunCallbackInput {
+  readonly internalKind: InternalRunCallbackKind;
+  readonly secret: string;
+  readonly payload: unknown;
+}
+
+type ModelContext =
+  | {
+      readonly ok: true;
+      readonly modelPin: ModelFirstPin;
+      readonly effectiveModelProvider: string | null | undefined;
+    }
+  | {
+      readonly ok: false;
+      readonly failure: Exclude<RunGoalResult, { kind: "ok" }>;
+    };
+
+const GOAL_MEMORY_OBJECTIVE_EXCERPT_MAX_CHARS = 1024;
+const GOAL_MEMORY_RETRIEVAL_QUERY_MAX_CHARS = 1400;
+const GOAL_MEMORY_NO_SEARCH_SEPARATOR_MIN_CHARS = 32;
+
+function generateCallbackSecret(): string {
+  return randomBytes(32).toString("hex");
+}
+
+function isTerminalStatus(status: string): status is TerminalRunStatus {
+  return (
+    status === "completed" ||
+    status === "failed" ||
+    status === "timeout" ||
+    status === "cancelled"
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function agentSessionIdFromResult(result: unknown): string | null {
+  if (!isRecord(result)) {
+    return null;
+  }
+  const agentSessionId = result.agentSessionId;
+  return typeof agentSessionId === "string" ? agentSessionId : null;
+}
+
+function failureMessage(error: RunGoalResult): string {
+  if (error.kind === "conflict") {
+    return error.message;
+  }
+  if (error.kind === "run_error") {
+    return `${error.response.status} ${error.response.body.error.code}: ${error.response.body.error.message}`;
+  }
+  return `Unexpected successful run result: ${error.runId}`;
+}
+
+function stripGoalMemoryQueryMarkdown(text: string): string {
+  return text
+    .replace(/(\*{1,3}|_{1,3})(.+?)\1/g, "$2")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/^[-*_]{3,}\s*$/gm, "")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1 $2")
+    .replace(/^["'](.+)["']$/, "$1")
+    .trim();
+}
+
+function compactGoalMemoryQueryText(text: string): string {
+  return stripGoalMemoryQueryMarkdown(text)
+    .replace(
+      new RegExp(
+        `[^\\p{L}\\p{N}]{${GOAL_MEMORY_NO_SEARCH_SEPARATOR_MIN_CHARS},}`,
+        "gu",
+      ),
+      " ",
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function capGoalMemoryQueryText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) {
+    return text;
+  }
+  let endIndex = 0;
+  let charCount = 0;
+  for (const char of text) {
+    if (charCount === maxChars) {
+      return text.slice(0, endIndex).trimEnd();
+    }
+    endIndex += char.length;
+    charCount += 1;
+  }
+  return text;
+}
+
+function hasGoalMemorySearchTerm(text: string): boolean {
+  return /[\p{L}\p{N}]/u.test(text);
+}
+
+function goalMemoryPlaceholderKey(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isDefaultGoalMemoryPlaceholder(text: string): boolean {
+  return (
+    goalMemoryPlaceholderKey(text) ===
+    goalMemoryPlaceholderKey(DEFAULT_GOAL_OBJECTIVE_BRIEF)
+  );
+}
+
+function buildGoalMemoryRetrievalQuery(goal: {
+  readonly objective: string;
+  readonly objectiveBrief: string;
+}): string {
+  const objectiveBrief = compactGoalMemoryQueryText(goal.objectiveBrief);
+  const objectiveExcerpt = capGoalMemoryQueryText(
+    compactGoalMemoryQueryText(goal.objective),
+    GOAL_MEMORY_OBJECTIVE_EXCERPT_MAX_CHARS,
+  );
+  const isDefaultObjectiveBrief =
+    isDefaultGoalMemoryPlaceholder(objectiveBrief);
+  if (
+    isDefaultObjectiveBrief &&
+    (objectiveExcerpt.length === 0 ||
+      isDefaultGoalMemoryPlaceholder(objectiveExcerpt))
+  ) {
+    return "";
+  }
+  const parts = isDefaultObjectiveBrief
+    ? [objectiveExcerpt]
+    : objectiveBrief === objectiveExcerpt ||
+        objectiveExcerpt.startsWith(`${objectiveBrief} `)
+      ? [objectiveExcerpt]
+      : [objectiveBrief, objectiveExcerpt];
+  const query = capGoalMemoryQueryText(
+    parts
+      .filter((part) => {
+        return part.length > 0;
+      })
+      .join(" "),
+    GOAL_MEMORY_RETRIEVAL_QUERY_MAX_CHARS,
+  );
+  return hasGoalMemorySearchTerm(query) ? query : "";
+}
+
+function buildGoalContinuationPrompt(goal: {
+  readonly objective: string;
+  readonly objectiveBrief: string;
+}): string {
+  const lines = [
+    "# Current context",
+    "You are autonomously continuing a persistent goal on this web chat thread.",
+    "Everything you output is shown to the user in this thread.",
+    "",
+    "# Active thread goal",
+    "",
+    goal.objective,
+  ];
+  if (goal.objectiveBrief !== goal.objective) {
+    lines.push("", "# User-visible objective brief", "", goal.objectiveBrief);
+  }
+  lines.push(
+    "",
+    "# How to operate",
+    "",
+    "- Make concrete progress this turn, then end the turn. The goal automatically continues on the next idle.",
+    "- Persist all progress to durable external state (commits, PRs, uploaded artifacts, connectors).",
+    "- When the objective is verifiably done, audit it requirement-by-requirement against the current external state; only then run `zero goal complete`.",
+    "- If the same blocker stops you for 3 consecutive turns, run `zero goal block` and explain why.",
+    "- Inspect goal state anytime with `zero goal get`.",
+    "- Do not create, edit, pause, resume, or clear goals from an autonomous goal continuation run.",
+    "- Do not stop to ask the user and wait; act on the best available information.",
+  );
+  return lines.join("\n");
+}
+
+async function loadTerminatingRun(
+  db: Db,
+  runId: string,
+): Promise<TerminatingRunContext | null> {
+  const [row] = await db
+    .select({
+      runId: agentRuns.id,
+      status: agentRuns.status,
+      orgId: agentRuns.orgId,
+      userId: agentRuns.userId,
+      chatThreadId: zeroRuns.chatThreadId,
+    })
+    .from(agentRuns)
+    .innerJoin(zeroRuns, eq(zeroRuns.id, agentRuns.id))
+    .where(eq(agentRuns.id, runId))
+    .limit(1);
+
+  return row ?? null;
+}
+
+async function threadIsIdle(db: Db, chatThreadId: string): Promise<boolean> {
+  if (await hasUnclaimedQueuedUserMessage(db, chatThreadId)) {
+    return false;
+  }
+
+  const [activeRun] = await db
+    .select({ id: zeroRuns.id })
+    .from(zeroRuns)
+    .innerJoin(agentRuns, eq(agentRuns.id, zeroRuns.id))
+    .where(
+      and(
+        eq(zeroRuns.chatThreadId, chatThreadId),
+        inArray(agentRuns.status, ACTIVE_RUN_STATUSES),
+      ),
+    )
+    .limit(1);
+
+  return activeRun === undefined;
+}
+
+async function latestSessionIdForThread(
+  db: Db,
+  chatThreadId: string,
+): Promise<string | undefined> {
+  const rows = await db
+    .select({ result: agentRuns.result })
+    .from(zeroRuns)
+    .innerJoin(agentRuns, eq(agentRuns.id, zeroRuns.id))
+    .where(
+      and(eq(zeroRuns.chatThreadId, chatThreadId), isNotNull(agentRuns.result)),
+    )
+    .orderBy(desc(agentRuns.createdAt))
+    .limit(10);
+
+  for (const row of rows) {
+    const sessionId = agentSessionIdFromResult(row.result);
+    if (sessionId) {
+      return sessionId;
+    }
+  }
+  return undefined;
+}
+
+function buildGoalChatCallbacks(args: {
+  readonly threadId: string;
+  readonly agentId: string;
+}): readonly InternalRunCallbackInput[] {
+  return [
+    {
+      internalKind: "chat",
+      secret: generateCallbackSecret(),
+      payload: {
+        threadId: args.threadId,
+        agentId: args.agentId,
+        isGoalRun: true,
+      },
+    },
+  ];
+}
+
+async function resolveModelContext(args: {
+  readonly db: Db;
+  readonly orgId: string;
+  readonly userId: string;
+  readonly chatThreadId: string;
+  readonly signal: AbortSignal;
+}): Promise<ModelContext> {
+  const threadModelPin = await resolveRunChatThreadModelPin({
+    db: args.db,
+    orgId: args.orgId,
+    userId: args.userId,
+    threadId: args.chatThreadId,
+  });
+  args.signal.throwIfAborted();
+  if ("status" in threadModelPin) {
+    return {
+      ok: false,
+      failure: {
+        kind: "run_error",
+        response: { status: 400, body: threadModelPin.body },
+      },
+    };
+  }
+
+  const providerAdmission = await resolveModelFirstProviderAdmission({
+    db: args.db,
+    orgId: args.orgId,
+    userId: args.userId,
+    modelPin: threadModelPin,
+    requestedModelProvider: undefined,
+  });
+  args.signal.throwIfAborted();
+  if (providerAdmission.error) {
+    return {
+      ok: false,
+      failure: { kind: "run_error", response: providerAdmission.error },
+    };
+  }
+
+  return {
+    ok: true,
+    modelPin: threadModelPin,
+    effectiveModelProvider: providerAdmission.effectiveModelProvider,
+  };
+}
+
+const runGoalNow$ = command(
+  async (
+    { set },
+    args: {
+      readonly goal: GoalBootstrap;
+      readonly sessionId?: string;
+      readonly dispatchFailedCallbacks: DispatchFailedRunCallbacks;
+    },
+    signal: AbortSignal,
+  ): Promise<RunGoalResult> => {
+    const db = set(writeDb$);
+    const goal = args.goal;
+
+    const modelContext = await resolveModelContext({
+      db,
+      orgId: goal.orgId,
+      userId: goal.userId,
+      chatThreadId: goal.threadId,
+      signal,
+    });
+    if (!modelContext.ok) {
+      return modelContext.failure;
+    }
+    const { modelPin, effectiveModelProvider } = modelContext;
+
+    const normalizedGoal = {
+      ...goal,
+      objectiveBrief: normalizeGoalObjectiveBrief({
+        objective: goal.objective,
+        objectiveBrief: goal.objectiveBrief,
+      }),
+    };
+    const prompt = buildGoalContinuationPrompt(normalizedGoal);
+    const memoryRuntimeRetrievalQuery =
+      buildGoalMemoryRetrievalQuery(normalizedGoal);
+    const result = await set(
+      createZeroRun$,
+      {
+        auth: {
+          orgId: goal.orgId,
+          orgRole: "member",
+          userId: goal.userId,
+          tokenType: "session",
+        },
+        body: {
+          prompt,
+          agentId: goal.agentId,
+          ...(args.sessionId ? { sessionId: args.sessionId } : {}),
+          ...(effectiveModelProvider
+            ? { modelProvider: effectiveModelProvider }
+            : {}),
+        },
+        apiStartTime: now(),
+        triggerSource: "workflow-event",
+        memoryRuntimeRetrievalQuery,
+        chatThreadId: goal.threadId,
+        modelProviderId: modelPin.modelProviderId ?? undefined,
+        modelProviderCredentialScope:
+          modelPin.modelProviderCredentialScope ?? undefined,
+        selectedModelOverride: modelPin.selectedModel ?? undefined,
+        callbacks: buildGoalChatCallbacks({
+          threadId: goal.threadId,
+          agentId: goal.agentId,
+        }),
+        zeroRunMetadata: { goalId: goal.goalId, runGroupId: goal.goalId },
+        dispatchFailedCallbacks: args.dispatchFailedCallbacks,
+      },
+      signal,
+    );
+    signal.throwIfAborted();
+
+    if (result.status !== 201) {
+      return { kind: "run_error", response: result };
+    }
+
+    await postRunUserMessage({
+      db,
+      threadId: goal.threadId,
+      userId: goal.userId,
+      runId: result.body.runId,
+      prompt,
+      appendQueueMarker: result.body.status === "queued",
+      runGroupId: goal.goalId,
+      goalSnapshot: { objectiveBrief: normalizedGoal.objectiveBrief },
+    });
+    signal.throwIfAborted();
+
+    await db
+      .update(zeroRuns)
+      .set({
+        modelProvider: effectiveModelProvider,
+        modelProviderId: modelPin.modelProviderId,
+        modelProviderCredentialScope: modelPin.modelProviderCredentialScope,
+        selectedModel: modelPin.selectedModel,
+      })
+      .where(eq(zeroRuns.id, result.body.runId));
+    signal.throwIfAborted();
+
+    return { kind: "ok", runId: result.body.runId };
+  },
+);
+
+export const continueGoalIfIdle$ = command(
+  async (
+    { set },
+    args: {
+      readonly db: Db;
+      readonly runId: string;
+      readonly dispatchFailedCallbacks: DispatchFailedRunCallbacks;
+    },
+    signal: AbortSignal,
+  ): Promise<GoalContinuationResult> => {
+    const db = args.db;
+    const run = await loadTerminatingRun(db, args.runId);
+    signal.throwIfAborted();
+    if (!run?.chatThreadId) {
+      return { kind: "skipped", reason: "run-not-linked-to-chat-thread" };
+    }
+    if (!isTerminalStatus(run.status)) {
+      return { kind: "skipped", reason: "run-not-terminal" };
+    }
+    const goal = await loadActiveGoalForThread(db, {
+      orgId: run.orgId,
+      threadId: run.chatThreadId,
+    });
+    signal.throwIfAborted();
+    if (!goal) {
+      return { kind: "skipped", reason: "no-active-goal" };
+    }
+
+    if (
+      run.status === "cancelled" ||
+      run.status === "failed" ||
+      run.status === "timeout"
+    ) {
+      const paused = await pauseActiveGoalForThread(db, {
+        orgId: run.orgId,
+        userId: run.userId,
+        threadId: run.chatThreadId,
+      });
+      signal.throwIfAborted();
+      if (paused.kind !== "ok") {
+        return { kind: "skipped", reason: `pause-${paused.kind}` };
+      }
+      return { kind: "paused", goalId: goal.id };
+    }
+
+    if (!(await threadIsIdle(db, run.chatThreadId))) {
+      return { kind: "skipped", reason: "thread-not-idle" };
+    }
+    signal.throwIfAborted();
+
+    const sessionId = await latestSessionIdForThread(db, run.chatThreadId);
+    signal.throwIfAborted();
+    const runResult = await set(
+      runGoalNow$,
+      {
+        goal: {
+          goalId: goal.id,
+          orgId: goal.orgId,
+          userId: goal.ownerUserId,
+          threadId: goal.chatThreadId,
+          agentId: goal.agentId,
+          objective: goal.objective,
+          objectiveBrief: goal.objectiveBrief,
+        },
+        ...(sessionId ? { sessionId } : {}),
+        dispatchFailedCallbacks: args.dispatchFailedCallbacks,
+      },
+      signal,
+    );
+    signal.throwIfAborted();
+
+    if (runResult.kind === "ok") {
+      return { kind: "continued", runId: runResult.runId };
+    }
+    if (runResult.kind === "conflict") {
+      return { kind: "skipped", reason: "previous-run-active" };
+    }
+
+    const paused = await pauseActiveGoalForThread(db, {
+      orgId: run.orgId,
+      userId: run.userId,
+      threadId: run.chatThreadId,
+    });
+    signal.throwIfAborted();
+    const error = failureMessage(runResult);
+    log.warn("Goal continuation enqueue failed; goal paused", {
+      goalId: goal.id,
+      runId: run.runId,
+      error,
+      pauseResult: paused.kind,
+    });
+    return {
+      kind: "failed-to-enqueue",
+      goalId: goal.id,
+      error,
+    };
+  },
+);
+
+export const bootstrapGoalRun$ = command(
+  async (
+    { set },
+    args: {
+      readonly goal: GoalBootstrap;
+      readonly dispatchFailedCallbacks: DispatchFailedRunCallbacks;
+    },
+    signal: AbortSignal,
+  ): Promise<RunGoalResult> => {
+    return await set(
+      runGoalNow$,
+      {
+        goal: args.goal,
+        dispatchFailedCallbacks: args.dispatchFailedCallbacks,
+      },
+      signal,
+    );
+  },
+);

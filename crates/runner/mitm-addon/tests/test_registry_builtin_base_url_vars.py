@@ -1,0 +1,1267 @@
+"""Tests for registry built-in base URL variable resolution."""
+
+import json
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+import builtin_host_policy
+import registry
+from tests.registry_helpers import (
+    write_builtin_firewall_registry as _write_builtin_firewall_registry,
+)
+from tests.registry_helpers import (
+    write_trusted_catalog_cache_text,
+)
+
+_TEST_BUILTIN_FIREWALLS: dict[str, dict] = {}
+
+
+class _RegistryOptions:
+    def __init__(self) -> None:
+        self.vm0_builtin_firewall_catalog_cache_path = ""
+
+
+@pytest.fixture(autouse=True)
+def _registry_ctx(monkeypatch):
+    options = _RegistryOptions()
+    monkeypatch.setattr(registry.ctx, "options", options, raising=False)
+    monkeypatch.setattr(registry.ctx, "log", MagicMock(), raising=False)
+    _TEST_BUILTIN_FIREWALLS.clear()
+
+
+def install_test_builtin_firewall(
+    *,
+    name: str,
+    base: str,
+    host_policy: dict | None = None,
+) -> None:
+    api = {
+        "base": base,
+        "auth": {"headers": {"Authorization": "Bearer ${{ secrets.API_TOKEN }}"}},
+        "permissions": [{"name": "read", "rules": ["GET /items"]}],
+    }
+    if host_policy is not None:
+        api["hostPolicy"] = host_policy
+    _TEST_BUILTIN_FIREWALLS[name] = {"name": name, "apis": [api]}
+
+
+def _cache_path_for_registry(path):
+    return path.with_name(f"{path.stem}-builtin-firewall-catalog-cache.json")
+
+
+def _write_catalog_cache(path, firewalls: dict[str, dict]) -> None:
+    write_trusted_catalog_cache_text(
+        path,
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "catalogDigest": (
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                ),
+                "catalogVersion": "catalog-test",
+                "updatedAt": "2026-07-07T00:00:00.000Z",
+                "firewalls": firewalls,
+            },
+            sort_keys=True,
+        ),
+    )
+
+
+def _builtin_firewall(name: str) -> dict:
+    base_by_name = {
+        "jira": "https://${{ vars.JIRA_DOMAIN }}",
+        "n8n": "${{ vars.N8N_BASE_URL }}/api/v1",
+        "shopify": "https://${{ vars.SHOPIFY_SHOP }}.myshopify.com/admin/api/2025-01",
+        "snowflake": "https://${{ vars.SNOWFLAKE_ACCOUNT }}.snowflakecomputing.com/api",
+        "strapi": "${{ vars.STRAPI_BASE_URL }}",
+        "zendesk": "https://${{ vars.ZENDESK_SUBDOMAIN }}.zendesk.com",
+    }
+    host_policy_by_name = {
+        "jira": {"kind": "providerOwned", "suffixes": ["atlassian.net"]},
+        "n8n": {"kind": "publicDestination"},
+        "shopify": {"kind": "providerOwned", "suffixes": ["myshopify.com"]},
+        "snowflake": {"kind": "providerOwned", "suffixes": ["snowflakecomputing.com"]},
+        "strapi": {"kind": "publicDestination"},
+    }
+    api = {
+        "base": base_by_name[name],
+        "auth": {"headers": {"Authorization": "Bearer ${{ secrets.API_TOKEN }}"}},
+        "permissions": [{"name": "read", "rules": ["GET /items"]}],
+    }
+    host_policy = host_policy_by_name.get(name)
+    if host_policy is not None:
+        api["hostPolicy"] = host_policy
+    return {"name": name, "apis": [api]}
+
+
+def write_builtin_firewall_registry(
+    path,
+    *,
+    run_id: str,
+    name: str,
+    base_url_vars: dict[str, str],
+    cache_firewall: dict | None = None,
+) -> None:
+    _write_builtin_firewall_registry(
+        path,
+        run_id=run_id,
+        name=name,
+        base_url_vars=base_url_vars,
+    )
+    firewall = cache_firewall or _TEST_BUILTIN_FIREWALLS.get(name) or _builtin_firewall(name)
+    cache_path = _cache_path_for_registry(path)
+    _write_catalog_cache(cache_path, {firewall["name"]: firewall})
+    registry.ctx.options.vm0_builtin_firewall_catalog_cache_path = str(cache_path)
+
+
+class TestRegistryBuiltinBaseUrlVars:
+    def test_builtin_firewall_entry_resolves_dynamic_base_url_vars(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-zendesk",
+            name="zendesk",
+            base_url_vars={"ZENDESK_SUBDOMAIN": "acme"},
+        )
+
+        context = registry.get_vm_context("10.200.0.1", str(path))
+
+        assert context is not None
+        vm_info, compiled_firewalls, _ = context
+        assert compiled_firewalls is not None
+        assert vm_info["firewalls"][0]["apis"][0]["base"] == "https://acme.zendesk.com"
+
+    @pytest.mark.parametrize(
+        ("base_url_vars", "expected_message"),
+        [
+            ([], "baseUrlVars must be an object"),
+            ({"ZENDESK_SUBDOMAIN": 1}, "baseUrlVars must contain string values"),
+        ],
+    )
+    def test_malformed_base_url_vars_reject_vm(
+        self, tmp_path, base_url_vars: object, expected_message: str
+    ) -> None:
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-zendesk",
+            name="zendesk",
+            base_url_vars={"ZENDESK_SUBDOMAIN": "acme"},
+        )
+        data = json.loads(path.read_text())
+        data["vms"]["10.200.0.1"]["firewalls"][0]["baseUrlVars"] = base_url_vars
+        path.write_text(json.dumps(data))
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        assert "10.200.0.1" not in state.vms
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert invalid_vm.message == expected_message
+
+    def test_builtin_fixed_provider_suffix_rejects_authority_escape(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-shopify",
+            name="shopify",
+            base_url_vars={"SHOPIFY_SHOP": "attacker.example:443/capture"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert 'base URL variable "SHOPIFY_SHOP"' in invalid_vm.message
+
+    def test_builtin_fixed_provider_suffix_rejects_encoded_structure(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-shopify",
+            name="shopify",
+            base_url_vars={"SHOPIFY_SHOP": "attacker.example%3A443%2Fcapture"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert 'base URL variable "SHOPIFY_SHOP"' in invalid_vm.message
+
+    def test_builtin_fixed_provider_suffix_accepts_multi_label_fragment(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-snowflake",
+            name="snowflake",
+            base_url_vars={"SNOWFLAKE_ACCOUNT": "xy12345.us-east-1.aws"},
+        )
+
+        context = registry.get_vm_context("10.200.0.1", str(path))
+
+        assert context is not None
+        vm_info, compiled_firewalls, _ = context
+        assert compiled_firewalls is not None
+        assert vm_info["firewalls"][0]["apis"][0]["base"] == (
+            "https://xy12345.us-east-1.aws.snowflakecomputing.com/api"
+        )
+
+    def test_builtin_fixed_provider_suffix_rejects_path_injection(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-snowflake",
+            name="snowflake",
+            base_url_vars={"SNOWFLAKE_ACCOUNT": "xy12345.us-east-1.aws/capture"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert 'base URL variable "SNOWFLAKE_ACCOUNT"' in invalid_vm.message
+
+    def test_builtin_provider_owned_whole_authority_accepts_allowed_host(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-jira",
+            name="jira",
+            base_url_vars={"JIRA_DOMAIN": "acme.atlassian.net"},
+        )
+
+        context = registry.get_vm_context("10.200.0.1", str(path))
+
+        assert context is not None
+        vm_info, compiled_firewalls, _ = context
+        assert compiled_firewalls is not None
+        assert vm_info["firewalls"][0]["apis"][0]["base"] == "https://acme.atlassian.net"
+
+    def test_builtin_host_policy_marks_resolved_api_for_runtime_enforcement(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-jira",
+            name="jira",
+            base_url_vars={"JIRA_DOMAIN": "acme.atlassian.net"},
+        )
+
+        context = registry.get_vm_context("10.200.0.1", str(path))
+
+        assert context is not None
+        vm_info, compiled_firewalls, _ = context
+        assert compiled_firewalls is not None
+        api = vm_info["firewalls"][0]["apis"][0]
+        assert isinstance(
+            api[builtin_host_policy.BUILTIN_HOST_POLICY_RUNTIME_MARKER],
+            builtin_host_policy.CompiledBuiltinHostPolicy,
+        )
+
+    def test_builtin_provider_owned_accepts_idna_dot_equivalent_host(self, tmp_path):
+        for index, dot in enumerate(("\u3002", "\uff0e", "\uff61")):
+            path = tmp_path / f"registry-{index}.json"
+            host = f"acme{dot}atlassian{dot}net"
+            write_builtin_firewall_registry(
+                path,
+                run_id=f"run-jira-{index}",
+                name="jira",
+                base_url_vars={"JIRA_DOMAIN": host},
+            )
+
+            context = registry.get_vm_context("10.200.0.1", str(path))
+
+            assert context is not None
+            vm_info, compiled_firewalls, _ = context
+            assert compiled_firewalls is not None
+            assert vm_info["firewalls"][0]["apis"][0]["base"] == f"https://{host}"
+
+    def test_builtin_provider_owned_rejects_unsafe_idna_compatibility_host(self, tmp_path):
+        install_test_builtin_firewall(
+            name="unsafe-provider-host",
+            base="https://fa\u212a.example.com",
+            host_policy={"kind": "providerOwned", "suffixes": ["example.com"]},
+        )
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-unsafe-provider-host",
+            name="unsafe-provider-host",
+            base_url_vars={},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert "catalog cache unavailable: cache_invalid" in invalid_vm.message
+
+    def test_builtin_provider_owned_accepts_percent_encoded_idna_host(self, tmp_path):
+        install_test_builtin_firewall(
+            name="encoded-provider-host",
+            base="https://${{ vars.API_HOST }}",
+            host_policy={"kind": "providerOwned", "suffixes": ["example.com"]},
+        )
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-encoded-provider-host",
+            name="encoded-provider-host",
+            base_url_vars={"API_HOST": "b%C3%BCcher.example.com"},
+        )
+
+        context = registry.get_vm_context("10.200.0.1", str(path))
+
+        assert context is not None
+        vm_info, compiled_firewalls, _ = context
+        assert compiled_firewalls is not None
+        assert vm_info["firewalls"][0]["apis"][0]["base"] == ("https://b%C3%BCcher.example.com")
+
+    def test_builtin_public_destination_rejects_unsafe_idna_compatibility_host(self, tmp_path):
+        install_test_builtin_firewall(
+            name="unsafe-public-host",
+            base="https://fa\u212a.example.com",
+            host_policy={"kind": "publicDestination"},
+        )
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-unsafe-public-host",
+            name="unsafe-public-host",
+            base_url_vars={},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert "catalog cache unavailable: cache_invalid" in invalid_vm.message
+
+    def test_builtin_public_destination_rejects_empty_port_authority(self, tmp_path):
+        install_test_builtin_firewall(
+            name="empty-port-public-host",
+            base="https://example.com:",
+            host_policy={"kind": "publicDestination"},
+        )
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-empty-port-public-host",
+            name="empty-port-public-host",
+            base_url_vars={},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert "catalog cache unavailable: cache_invalid" in invalid_vm.message
+
+    def test_builtin_public_destination_rejects_wildcard_hosts(self, tmp_path):
+        for index, value in enumerate(("https://*.example.com", "https://%2a.example.com")):
+            path = tmp_path / f"registry-{index}.json"
+            write_builtin_firewall_registry(
+                path,
+                run_id="run-strapi",
+                name="strapi",
+                base_url_vars={"STRAPI_BASE_URL": value},
+            )
+
+            with patch.object(registry.ctx, "log", MagicMock(), create=True):
+                context = registry.get_vm_context("10.200.0.1", str(path))
+                state = registry.load_registry_state(str(path))
+
+            assert context is None
+            assert not isinstance(state, registry.RegistryUnavailable)
+            invalid_vm = state.invalid_vms["10.200.0.1"]
+            assert invalid_vm.reason == "invalid_firewalls"
+            assert "resolved base URL is invalid" in invalid_vm.message
+
+    def test_builtin_public_destination_rejects_userinfo(self, tmp_path):
+        for index, value in enumerate(
+            ("https://user@example.com", "https://user:pass@example.com")
+        ):
+            path = tmp_path / f"registry-userinfo-{index}.json"
+            write_builtin_firewall_registry(
+                path,
+                run_id="run-strapi",
+                name="strapi",
+                base_url_vars={"STRAPI_BASE_URL": value},
+            )
+
+            with patch.object(registry.ctx, "log", MagicMock(), create=True):
+                context = registry.get_vm_context("10.200.0.1", str(path))
+                state = registry.load_registry_state(str(path))
+
+            assert context is None
+            assert not isinstance(state, registry.RegistryUnavailable)
+            invalid_vm = state.invalid_vms["10.200.0.1"]
+            assert invalid_vm.reason == "invalid_firewalls"
+            assert "resolved base URL is invalid" in invalid_vm.message
+
+    def test_builtin_provider_owned_whole_authority_rejects_unowned_hosts(self, tmp_path):
+        for value in [
+            "attacker.example",
+            "evil-atlassian.net",
+            "atlassian.net.evil",
+            "127.0.0.1",
+        ]:
+            path = tmp_path / f"registry-{value.replace('/', '-')}.json"
+            write_builtin_firewall_registry(
+                path,
+                run_id="run-jira",
+                name="jira",
+                base_url_vars={"JIRA_DOMAIN": value},
+            )
+
+            with patch.object(registry.ctx, "log", MagicMock(), create=True):
+                context = registry.get_vm_context("10.200.0.1", str(path))
+                state = registry.load_registry_state(str(path))
+
+            assert context is None
+            assert not isinstance(state, registry.RegistryUnavailable)
+            invalid_vm = state.invalid_vms["10.200.0.1"]
+            assert invalid_vm.reason == "invalid_firewalls"
+            assert "host policy does not allow resolved host" in invalid_vm.message
+
+    @pytest.mark.parametrize(
+        ("host_policy", "expected_message"),
+        [
+            pytest.param(
+                {"kind": "providerOwned", "exactHosts": [".api.example.com"]},
+                "exactHosts must be fixed hostnames with at least two labels",
+                id="provider-owned-exact-leading-dot",
+            ),
+            pytest.param(
+                {"kind": "providerOwned", "exactHosts": ["127.0.0.1"]},
+                "exactHosts must be fixed hostnames with at least two labels",
+                id="provider-owned-exact-ip-literal",
+            ),
+            pytest.param(
+                {"kind": "providerOwned", "exactHosts": ["0177.0.0.1"]},
+                "exactHosts must be fixed hostnames with at least two labels",
+                id="provider-owned-exact-ipv4-like",
+            ),
+            pytest.param(
+                {"kind": "providerOwned", "exactHosts": ["api.例子.com"]},
+                "exactHosts must be fixed hostnames with at least two labels",
+                id="provider-owned-exact-non-ascii",
+            ),
+            pytest.param(
+                {"kind": "providerOwned", "suffixes": ["*.example.com"]},
+                "suffixes must be fixed hostnames with at least two labels",
+                id="provider-owned-suffix-wildcard",
+            ),
+            pytest.param(
+                {"kind": "providerOwned", "suffixes": ["..example.com"]},
+                "suffixes must be fixed hostnames with at least two labels",
+                id="provider-owned-suffix-empty-label",
+            ),
+            pytest.param(
+                {"kind": "providerOwned", "suffixes": ["com"]},
+                "suffixes must be fixed hostnames with at least two labels",
+                id="provider-owned-suffix-single-label",
+            ),
+            pytest.param(
+                {
+                    "kind": "providerOwned",
+                    "suffixes": ["example.com"],
+                    "allowNonDefaultPort": "true",
+                },
+                "hostPolicy.allowNonDefaultPort must be a boolean",
+                id="provider-owned-non-boolean-port-policy",
+            ),
+            pytest.param(
+                {"kind": "providerOwned", "suffixes": ["example.com"], "extra": True},
+                "hostPolicy has unsupported keys: extra",
+                id="provider-owned-unsupported-key",
+            ),
+            pytest.param(
+                {"kind": "publicDestination", "extra": True},
+                "hostPolicy has unsupported keys: extra",
+                id="public-destination-unsupported-key",
+            ),
+        ],
+    )
+    def test_builtin_rejects_invalid_host_policies(
+        self, tmp_path, host_policy: dict, expected_message: str
+    ) -> None:
+        name = "invalid-host-policy"
+        install_test_builtin_firewall(
+            name=name,
+            base="https://${{ vars.API_HOST }}",
+            host_policy=host_policy,
+        )
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id=f"run-{name}",
+            name=name,
+            base_url_vars={"API_HOST": "api.example.com"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True) as log:
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        warning_messages = [call.args[0] for call in log.warn.call_args_list]
+        assert any(expected_message in message for message in warning_messages)
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert "catalog cache unavailable: cache_invalid" in invalid_vm.message
+
+    def test_builtin_provider_owned_whole_authority_rejects_non_default_port(self, tmp_path):
+        install_test_builtin_firewall(
+            name="provider-owned-port",
+            base="https://${{ vars.API_HOST }}:444/v1",
+            host_policy={"kind": "providerOwned", "suffixes": ["example.com"]},
+        )
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-provider-owned-port",
+            name="provider-owned-port",
+            base_url_vars={"API_HOST": "api.example.com"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert "host policy does not allow non-default ports" in invalid_vm.message
+
+    def test_builtin_whole_authority_rejects_path_injection(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-jira",
+            name="jira",
+            base_url_vars={"JIRA_DOMAIN": "attacker.example/capture"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert 'base URL variable "JIRA_DOMAIN"' in invalid_vm.message
+
+    def test_builtin_base_url_var_rejects_firewall_parameter_syntax(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-strapi",
+            name="strapi",
+            base_url_vars={"STRAPI_BASE_URL": "https://{host}.example.test"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert 'base URL variable "STRAPI_BASE_URL"' in invalid_vm.message
+
+    def test_builtin_base_url_var_rejects_unicode_whitespace(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-strapi",
+            name="strapi",
+            base_url_vars={"STRAPI_BASE_URL": "https://strapi.example.test/work\u00a0flows"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert 'base URL variable "STRAPI_BASE_URL"' in invalid_vm.message
+
+    def test_builtin_public_destination_accepts_public_host_with_port(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-strapi",
+            name="strapi",
+            base_url_vars={"STRAPI_BASE_URL": "https://strapi.example.test:8443"},
+        )
+
+        context = registry.get_vm_context("10.200.0.1", str(path))
+
+        assert context is not None
+        vm_info, compiled_firewalls, _ = context
+        assert compiled_firewalls is not None
+        assert vm_info["firewalls"][0]["apis"][0]["base"] == ("https://strapi.example.test:8443")
+
+    def test_builtin_public_destination_accepts_public_ip_literals(self, tmp_path):
+        for value in [
+            "https://8.8.8.8",
+            "https://[2606:4700:4700::1111]",
+            "https://[2001:1::1]",
+            "https://[2001:1::2]",
+            "https://[2001:1::3]",
+            "https://[2001:3::1]",
+            "https://[2001:4:112::1]",
+            "https://[2001:20::1]",
+            "https://[2001:30::1]",
+            "https://[2003::1]",
+            "https://100.128.0.1",
+            "https://172.32.0.1",
+            "https://192.0.0.9",
+            "https://192.0.0.10",
+            "https://192.0.1.1",
+            "https://[3fff:1000::1]",
+        ]:
+            path = tmp_path / f"registry-{abs(hash(value))}.json"
+            write_builtin_firewall_registry(
+                path,
+                run_id="run-strapi",
+                name="strapi",
+                base_url_vars={"STRAPI_BASE_URL": value},
+            )
+
+            context = registry.get_vm_context("10.200.0.1", str(path))
+
+            assert context is not None
+            vm_info, compiled_firewalls, _ = context
+            assert compiled_firewalls is not None
+            assert vm_info["firewalls"][0]["apis"][0]["base"] == value
+
+    def test_builtin_public_destination_rejects_non_public_ip_literals(self, tmp_path):
+        for value in [
+            "https://127.0.0.1",
+            "https://127.0.0.1.",
+            "https://10.0.0.5",
+            "https://169.254.1.2",
+            "https://192.168.1.10",
+            "https://192.0.0.8",
+            "https://192.0.0.11",
+            "https://224.0.0.1",
+            "https://[::1]",
+            "https://[fc00::1]",
+            "https://[64:ff9b::808:808]",
+            "https://[2001::1]",
+            "https://[2001:2::1]",
+            "https://[2001:4::1]",
+            "https://[2001:10::1]",
+            "https://[2001:1ff::1]",
+            "https://[2001:db8::1]",
+            "https://[2002:808:808::1]",
+            "https://[3fff::1]",
+            "https://[3fff:0fff::1]",
+            "https://[4000::1]",
+            "https://[ff0e::1]",
+        ]:
+            path = tmp_path / f"registry-{abs(hash(value))}.json"
+            write_builtin_firewall_registry(
+                path,
+                run_id="run-strapi",
+                name="strapi",
+                base_url_vars={"STRAPI_BASE_URL": value},
+            )
+
+            with patch.object(registry.ctx, "log", MagicMock(), create=True):
+                context = registry.get_vm_context("10.200.0.1", str(path))
+                state = registry.load_registry_state(str(path))
+
+            assert context is None
+            assert not isinstance(state, registry.RegistryUnavailable)
+            invalid_vm = state.invalid_vms["10.200.0.1"]
+            assert invalid_vm.reason == "invalid_firewalls"
+            assert "host policy does not allow non-public IP literal" in invalid_vm.message
+
+    def test_builtin_public_destination_rejects_trailing_dot_ip_literal(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-strapi",
+            name="strapi",
+            base_url_vars={"STRAPI_BASE_URL": "https://8.8.8.8."},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert "host policy does not allow non-public IP literal" in invalid_vm.message
+
+    def test_builtin_public_destination_rejects_scoped_ip_literal(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-strapi",
+            name="strapi",
+            base_url_vars={"STRAPI_BASE_URL": "https://[2606:4700:4700::1111%25lo]"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert 'builtin firewall "strapi" resolved base URL is invalid' in invalid_vm.message
+
+    def test_builtin_public_destination_rejects_bracketed_ipv4_literal(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-strapi",
+            name="strapi",
+            base_url_vars={"STRAPI_BASE_URL": "https://[8.8.8.8]"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert 'builtin firewall "strapi" resolved base URL is invalid' in invalid_vm.message
+
+    def test_builtin_public_destination_rejects_ipvfuture_literal(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-strapi",
+            name="strapi",
+            base_url_vars={"STRAPI_BASE_URL": "https://[v1.invalid]"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert 'builtin firewall "strapi" resolved base URL is invalid' in invalid_vm.message
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "https://strapi.example.test?next=/../",
+            "https://strapi.example.test#next=/../",
+        ],
+    )
+    def test_builtin_base_url_does_not_treat_query_or_fragment_as_path(self, tmp_path, value):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-strapi",
+            name="strapi",
+            base_url_vars={"STRAPI_BASE_URL": value},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert 'builtin firewall "strapi" resolved base URL is invalid' in invalid_vm.message
+
+    def test_builtin_base_url_prefix_preserves_fixed_path_suffix(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-n8n",
+            name="n8n",
+            base_url_vars={"N8N_BASE_URL": "https://n8n.example.test/workflows"},
+        )
+
+        context = registry.get_vm_context("10.200.0.1", str(path))
+
+        assert context is not None
+        vm_info, compiled_firewalls, _ = context
+        assert compiled_firewalls is not None
+        assert vm_info["firewalls"][0]["apis"][0]["base"] == (
+            "https://n8n.example.test/workflows/api/v1"
+        )
+
+    def test_builtin_base_url_prefix_accepts_encoded_path_separator(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-n8n",
+            name="n8n",
+            base_url_vars={"N8N_BASE_URL": "https://n8n.example.test/work%2fflows"},
+        )
+
+        context = registry.get_vm_context("10.200.0.1", str(path))
+
+        assert context is not None
+        vm_info, compiled_firewalls, _ = context
+        assert compiled_firewalls is not None
+        assert vm_info["firewalls"][0]["apis"][0]["base"] == (
+            "https://n8n.example.test/work%2fflows/api/v1"
+        )
+
+    def test_builtin_base_url_prefix_rejects_path_dot_segments(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-n8n",
+            name="n8n",
+            base_url_vars={"N8N_BASE_URL": "https://n8n.example.test/workflows/.."},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert (
+            'base URL variable "N8N_BASE_URL" must not contain unsafe path segments '
+            "before a fixed path suffix"
+        ) in invalid_vm.message
+
+    def test_builtin_base_url_prefix_rejects_encoded_path_dot_segments(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-n8n",
+            name="n8n",
+            base_url_vars={"N8N_BASE_URL": "https://n8n.example.test/workflows/%2e%2e"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert (
+            'base URL variable "N8N_BASE_URL" must not contain unsafe path segments '
+            "before a fixed path suffix"
+        ) in invalid_vm.message
+
+    def test_builtin_path_segment_var_accepts_fixed_suffix(self, tmp_path):
+        install_test_builtin_firewall(
+            name="tenant-path",
+            base="https://api.example.test/accounts/${{ vars.TENANT }}/v1",
+        )
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-tenant-path",
+            name="tenant-path",
+            base_url_vars={"TENANT": "acme:prod"},
+        )
+
+        context = registry.get_vm_context("10.200.0.1", str(path))
+
+        assert context is not None
+        vm_info, compiled_firewalls, _ = context
+        assert compiled_firewalls is not None
+        assert vm_info["firewalls"][0]["apis"][0]["base"] == (
+            "https://api.example.test/accounts/acme:prod/v1"
+        )
+
+    def test_builtin_path_segment_var_rejects_path_injection(self, tmp_path):
+        install_test_builtin_firewall(
+            name="tenant-path",
+            base="https://api.example.test/accounts/${{ vars.TENANT }}/v1",
+        )
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-tenant-path",
+            name="tenant-path",
+            base_url_vars={"TENANT": "acme/../admin"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert 'base URL variable "TENANT"' in invalid_vm.message
+
+    def test_builtin_path_segment_var_rejects_encoded_path_separator(self, tmp_path):
+        install_test_builtin_firewall(
+            name="tenant-path",
+            base="https://api.example.test/accounts/${{ vars.TENANT }}/v1",
+        )
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-tenant-path",
+            name="tenant-path",
+            base_url_vars={"TENANT": "acme%252fprod"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert 'base URL variable "TENANT"' in invalid_vm.message
+
+    def test_builtin_path_segment_var_rejects_dot_segment(self, tmp_path):
+        install_test_builtin_firewall(
+            name="tenant-path",
+            base="https://api.example.test/accounts/${{ vars.TENANT }}/v1",
+        )
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-tenant-path",
+            name="tenant-path",
+            base_url_vars={"TENANT": "%2e%2e"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert 'base URL variable "TENANT"' in invalid_vm.message
+
+    def test_builtin_path_segment_var_rejects_path_parameter_dot_segment(self, tmp_path):
+        install_test_builtin_firewall(
+            name="tenant-path",
+            base="https://api.example.test/accounts/${{ vars.TENANT }}/v1",
+        )
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-tenant-path",
+            name="tenant-path",
+            base_url_vars={"TENANT": "..;type=folder"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert 'base URL variable "TENANT"' in invalid_vm.message
+
+    def test_builtin_path_segment_var_rejects_nested_encoded_dot_segment(self, tmp_path):
+        install_test_builtin_firewall(
+            name="tenant-path",
+            base="https://api.example.test/accounts/${{ vars.TENANT }}/v1",
+        )
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-tenant-path",
+            name="tenant-path",
+            base_url_vars={"TENANT": "%252e%252e"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert 'base URL variable "TENANT"' in invalid_vm.message
+
+    def test_builtin_path_segment_var_rejects_compatibility_dot_segment(self, tmp_path):
+        install_test_builtin_firewall(
+            name="tenant-path",
+            base="https://api.example.test/accounts/${{ vars.TENANT }}/v1",
+        )
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-tenant-path",
+            name="tenant-path",
+            base_url_vars={"TENANT": "\uff0e\uff0e"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert 'base URL variable "TENANT"' in invalid_vm.message
+
+    def test_builtin_path_var_allows_dot_outside_dot_segment(self, tmp_path):
+        install_test_builtin_firewall(
+            name="path-fragment",
+            base="https://api.example.test/v${{ vars.VERSION }}",
+        )
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-path-fragment",
+            name="path-fragment",
+            base_url_vars={"VERSION": "%2e1"},
+        )
+
+        context = registry.get_vm_context("10.200.0.1", str(path))
+
+        assert context is not None
+        vm_info, compiled_firewalls, _ = context
+        assert compiled_firewalls is not None
+        assert vm_info["firewalls"][0]["apis"][0]["base"] == ("https://api.example.test/v%2e1")
+
+    def test_builtin_path_vars_reject_combined_dot_segment(self, tmp_path):
+        install_test_builtin_firewall(
+            name="multi-path-segment",
+            base="https://api.example.test/accounts/${{ vars.A }}${{ vars.B }}/v1",
+        )
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-multi-path-segment",
+            name="multi-path-segment",
+            base_url_vars={"A": ".", "B": "."},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert "resolved base URL has unsafe path segments" in invalid_vm.message
+
+    def test_builtin_path_vars_accept_combined_safe_segment(self, tmp_path):
+        install_test_builtin_firewall(
+            name="multi-path-segment",
+            base="https://api.example.test/accounts/${{ vars.A }}${{ vars.B }}/v1",
+        )
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-multi-path-segment",
+            name="multi-path-segment",
+            base_url_vars={"A": "v", "B": "1"},
+        )
+
+        context = registry.get_vm_context("10.200.0.1", str(path))
+
+        assert context is not None
+        vm_info, compiled_firewalls, _ = context
+        assert compiled_firewalls is not None
+        assert vm_info["firewalls"][0]["apis"][0]["base"] == (
+            "https://api.example.test/accounts/v1/v1"
+        )
+
+    def test_builtin_port_var_accepts_numeric_port(self, tmp_path):
+        install_test_builtin_firewall(
+            name="port-api",
+            base="https://api.example.test:${{ vars.API_PORT }}/v1",
+        )
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-port-api",
+            name="port-api",
+            base_url_vars={"API_PORT": "8443"},
+        )
+
+        context = registry.get_vm_context("10.200.0.1", str(path))
+
+        assert context is not None
+        vm_info, compiled_firewalls, _ = context
+        assert compiled_firewalls is not None
+        assert vm_info["firewalls"][0]["apis"][0]["base"] == ("https://api.example.test:8443/v1")
+
+    def test_builtin_port_var_rejects_non_numeric_port(self, tmp_path):
+        install_test_builtin_firewall(
+            name="port-api",
+            base="https://api.example.test:${{ vars.API_PORT }}/v1",
+        )
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-port-api",
+            name="port-api",
+            base_url_vars={"API_PORT": "443/path"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert 'base URL variable "API_PORT"' in invalid_vm.message
+
+    def test_credentialed_builtin_firewall_entry_rejects_http_dynamic_base(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-strapi",
+            name="strapi",
+            base_url_vars={"STRAPI_BASE_URL": "http://strapi.example.test"},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        invalid_vm = state.invalid_vms["10.200.0.1"]
+        assert invalid_vm.reason == "invalid_firewalls"
+        assert "credentialed base URL must use https" in invalid_vm.message
+
+    def test_credentialed_builtin_firewall_entry_accepts_https_dynamic_base(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-strapi",
+            name="strapi",
+            base_url_vars={"STRAPI_BASE_URL": "https://strapi.example.test"},
+        )
+
+        context = registry.get_vm_context("10.200.0.1", str(path))
+
+        assert context is not None
+        vm_info, compiled_firewalls, _ = context
+        assert compiled_firewalls is not None
+        assert vm_info["firewalls"][0]["apis"][0]["base"] == ("https://strapi.example.test")
+
+    def test_builtin_firewall_entry_missing_dynamic_var_rejects_vm(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-zendesk",
+            name="zendesk",
+            base_url_vars={},
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        assert state.invalid_vms["10.200.0.1"].reason == "invalid_firewalls"
+        assert "ZENDESK_SUBDOMAIN" in state.invalid_vms["10.200.0.1"].message
+
+    def test_builtin_firewall_entry_does_not_read_top_level_vars(self, tmp_path):
+        path = tmp_path / "registry.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "vms": {
+                        "10.200.0.1": {
+                            "runId": "run-zendesk",
+                            "vars": {"ZENDESK_SUBDOMAIN": "top-level"},
+                            "firewalls": [{"kind": "builtin", "name": "zendesk"}],
+                        }
+                    },
+                    "updatedAt": 0,
+                }
+            )
+        )
+        cache_path = _cache_path_for_registry(path)
+        _write_catalog_cache(cache_path, {"zendesk": _builtin_firewall("zendesk")})
+        registry.ctx.options.vm0_builtin_firewall_catalog_cache_path = str(cache_path)
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        assert state.invalid_vms["10.200.0.1"].reason == "invalid_firewalls"
+        assert "ZENDESK_SUBDOMAIN" in state.invalid_vms["10.200.0.1"].message
+
+    def test_unknown_builtin_firewall_entry_rejects_vm(self, tmp_path):
+        path = tmp_path / "registry.json"
+        write_builtin_firewall_registry(
+            path,
+            run_id="run-missing",
+            name="missing-firewall",
+            base_url_vars={},
+            cache_firewall=_builtin_firewall("zendesk"),
+        )
+
+        with patch.object(registry.ctx, "log", MagicMock(), create=True):
+            context = registry.get_vm_context("10.200.0.1", str(path))
+            state = registry.load_registry_state(str(path))
+
+        assert context is None
+        assert not isinstance(state, registry.RegistryUnavailable)
+        assert state.invalid_vms["10.200.0.1"].reason == "invalid_firewalls"
+        assert "missing-firewall" in state.invalid_vms["10.200.0.1"].message

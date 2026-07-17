@@ -1,0 +1,857 @@
+name: Crates
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  merge_group:
+
+concurrency:
+  group: crates-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || (github.event_name == 'merge_group' && format('merge-queue-{0}', github.run_id) || 'main') }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Detect release-please context across all event types (PR, push, merge queue).
+  detect-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Check for release-please
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_REF: ${{ github.head_ref || '' }}
+          COMMIT_MSG: ${{ github.event.head_commit.message || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          MQ_HEAD_REF: ${{ github.event.merge_group.head_ref || '' }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [[ "$HEAD_REF" == release-please--branches--* ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Release-please PR detected (branch: $HEAD_REF)"
+            exit 0
+          fi
+          if [[ "$EVENT_NAME" == "push" ]] && [[ "$COMMIT_MSG" == chore:\ release* ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Release-please push detected (message: $COMMIT_MSG)"
+            exit 0
+          fi
+          if [[ "$EVENT_NAME" == "merge_group" ]] && [[ -n "$MQ_HEAD_REF" ]]; then
+            PR_NUM=$(echo "$MQ_HEAD_REF" | grep -oE 'pr-[0-9]+' | head -1 | sed 's/pr-//')
+            if [[ -n "$PR_NUM" ]]; then
+              PR_BRANCH=$(gh pr view "$PR_NUM" --repo "$REPO" --json headRefName --jq .headRefName 2>/dev/null || echo "")
+              if [[ "$PR_BRANCH" == release-please--branches--* ]]; then
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                echo "Release-please merge queue entry detected (PR #$PR_NUM, branch: $PR_BRANCH)"
+                exit 0
+              fi
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Not a release-please context"
+
+  detect:
+    needs: [detect-release]
+    # Skip for release-please PRs, commits, and merge queue entries
+    if: needs.detect-release.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/vm0-ai/vm0-toolchain-rust:20260622
+    outputs:
+      any-changed: ${{ steps.detect.outputs.any-changed }}
+      ci-changed: ${{ steps.detect.outputs.ci-changed }}
+      mitm-addon-test-inputs-changed: ${{ steps.detect.outputs.mitm-addon-test-inputs-changed }}
+      mitm-addon-pricing-seed-changed: ${{ steps.detect.outputs.mitm-addon-pricing-seed-changed }}
+      api-contracts-rust-bindings-changed: ${{ steps.detect.outputs.api-contracts-rust-bindings-changed }}
+      ably-subscriber-changed: ${{ steps.detect.outputs.ably-subscriber-changed }}
+      api-contracts-changed: ${{ steps.detect.outputs.api-contracts-changed }}
+      runner-changed: ${{ steps.detect.outputs.runner-changed }}
+      nbd-cow-changed: ${{ steps.detect.outputs.nbd-cow-changed }}
+      vsock-test-changed: ${{ steps.detect.outputs.vsock-test-changed }}
+      crates-runner-consumer-needed: ${{ steps.runner-tests.outputs.crates-runner-consumer-needed }}
+      metal-job-ref: ${{ steps.runner-job-ref.outputs.job-ref }}
+      runner-image-job-ref: ${{ steps.runner-job-ref.outputs.image-job-ref }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed crates
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CHECKOUT_REF: ${{ github.ref }}
+          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          # In CI containers, the repo may be owned by a different user (host vs container).
+          # Git 2.35.2+ rejects such repos unless marked as safe.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" 2>/dev/null || true
+
+          BASE_REF=$(.github/scripts/changed-base-ref.sh)
+          echo "${{ github.event_name }} mode: comparing against base $BASE_REF"
+          # Check if the workflow file or ansible playbooks changed
+          if git diff --name-only "$BASE_REF" HEAD | grep -qE "^\.github/workflows/(crates|runner-image)\.yml$|^\.github/actions/(setup-ssh-tunnel|provision)/|^\.github/scripts/|^ansible/"; then
+            echo "ci-changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ci-changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # scripts/crate-changed.sh: exit 0=changed, 1=not changed, 2+=error
+          check_crate() {
+            local rc=0
+            ./scripts/crate-changed.sh "$1" "$BASE_REF" && rc=0 || rc=$?
+            if [ $rc -eq 0 ]; then
+              echo "$1-changed=true" >> "$GITHUB_OUTPUT"
+            elif [ $rc -eq 1 ]; then
+              echo "$1-changed=false" >> "$GITHUB_OUTPUT"
+            else
+              exit $rc
+            fi
+          }
+          check_crate ably-subscriber
+          check_crate api-contracts
+          check_crate runner
+          check_crate nbd-cow
+          check_crate vsock-test
+
+          # Aggregate: true if any crate or CI config changed
+          if grep -q "=true" "$GITHUB_OUTPUT"; then
+            echo "any-changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "any-changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # The api-contracts Rust bindings are generated from selected
+          # TypeScript contract files, and the checked artifacts live under
+          # crates/api-contracts.
+          # Keep this output separate from any-changed so a TS-only contract
+          # edit runs the drift check without forcing every Rust crate job to
+          # run.
+          api_contracts_rust_bindings_changed=false
+          changed_files="$(mktemp)"
+          git diff --name-only "$BASE_REF" HEAD > "$changed_files"
+          while IFS= read -r changed_file; do
+            case "$changed_file" in
+              crates/api-contracts/* | \
+              turbo/packages/api-contracts/package.json | \
+              turbo/packages/api-contracts/tsconfig.json | \
+              turbo/packages/api-contracts/src/contracts/* | \
+              turbo/packages/api-contracts/src/rust-bindings/* | \
+              turbo/pnpm-lock.yaml)
+                api_contracts_rust_bindings_changed=true
+                break
+                ;;
+            esac
+          done < "$changed_files"
+          echo "api-contracts-rust-bindings-changed=$api_contracts_rust_bindings_changed" >> "$GITHUB_OUTPUT"
+          rm -f "$changed_files"
+
+          # Shared firewall contracts are stored under turbo but are read by
+          # mitm-addon tests. Keep this separate from any-changed so a turbo-only
+          # contract edit runs mitm-addon-test without forcing every crate job.
+          if git diff --name-only "$BASE_REF" HEAD | grep -Eqx "turbo/packages/connectors/src/__tests__/(firewall-semantics-contract|firewall-base-url-validation-contract)\\.json"; then
+            echo "mitm-addon-test-inputs-changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mitm-addon-test-inputs-changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # test_x_billing.py checks X connector usage buckets against the
+          # API pricing seed. Keep this separate from any-changed so a
+          # turbo-only pricing edit runs mitm-addon-test without forcing every
+          # crate job to re-run.
+          if git diff --name-only "$BASE_REF" HEAD | grep -qx "turbo/apps/api/src/scripts/dev-seed.ts"; then
+            echo "mitm-addon-pricing-seed-changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mitm-addon-pricing-seed-changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Select runner test consumer
+        id: runner-tests
+        env:
+          CI_CHANGED: ${{ steps.detect.outputs.ci-changed }}
+          RUNNER_CHANGED: ${{ steps.detect.outputs.runner-changed }}
+        run: .github/scripts/runner-image-context.sh crates-consumer
+
+      - name: Select runner job refs
+        id: runner-job-ref
+        env:
+          METAL_HOSTS: ${{ secrets.AWS_METAL_RUNNER_HOSTS }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MQ_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          HEAD_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # Skip runner deployment if the PR was already merged or closed.
+            # A late pull_request:synchronize run can reach here after
+            # cleanup.yml has already stopped the runner — deploying again
+            # would resurrect a stale service that no cleanup will ever reach.
+            #
+            # Retry transient API failures, then fail loudly if the state
+            # stays unknown. Silently skipping would let the PR merge without
+            # runner coverage; fail-open would risk deploying a zombie runner.
+            # A red check is the right middle ground — re-run the job once
+            # the API recovers.
+            STATE=$(curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUMBER}" \
+              | jq -r .state)
+            if [ -z "$STATE" ]; then
+              echo "::error::Failed to query PR #${PR_NUMBER} state from GitHub API after retries"
+              exit 1
+            fi
+            if [ "$STATE" != "open" ]; then
+              echo "::warning::PR #${PR_NUMBER} is ${STATE}, skipping host/job-ref to prevent stale runner deployment"
+              exit 0
+            fi
+            IMAGE_JOB_REF="pr-${PR_NUMBER}"
+            JOB_REF="pr-${PR_NUMBER}-test"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            MQ_PR_NUM=$(echo "$MQ_HEAD_REF" | grep -oE 'pr-[0-9]+' | head -1 | sed 's/pr-//')
+            if [ -n "$MQ_PR_NUM" ]; then
+              IMAGE_JOB_REF="pr-${MQ_PR_NUM}"
+              JOB_REF="pr-${MQ_PR_NUM}-test"
+            else
+              echo "::error::Failed to extract PR number from merge_group head_ref: $MQ_HEAD_REF"
+              exit 1
+            fi
+          else
+            SHORT_SHA=$(printf '%s' "$HEAD_SHA" | cut -c1-12)
+            IMAGE_JOB_REF="staging-${SHORT_SHA}"
+            JOB_REF="staging-test"
+          fi
+
+          HOSTS=$(echo "$METAL_HOSTS" | tr ',' '\n' | grep . || true)
+          NUM_HOSTS=$(echo "$HOSTS" | grep -c . || true)
+          if [ "$NUM_HOSTS" -lt 1 ]; then
+            echo "No metal hosts configured, skipping runner job refs"
+            exit 0
+          fi
+          {
+            echo "job-ref=${JOB_REF}"
+            echo "image-job-ref=${IMAGE_JOB_REF}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Selected runner job refs: job-ref=${JOB_REF}, image-job-ref=${IMAGE_JOB_REF}"
+
+  runner-host-groups:
+    runs-on: ubuntu-latest
+    needs: [detect]
+    if: |
+      needs.detect.outputs.metal-job-ref != '' && (
+        needs.detect.outputs.crates-runner-consumer-needed == 'true' ||
+        needs.detect.outputs.ci-changed == 'true' ||
+        needs.detect.outputs.nbd-cow-changed == 'true'
+      )
+    timeout-minutes: 5
+    outputs:
+      # Keep cross-job architecture metadata sanitized. Jobs that need hosts
+      # resolve host data locally from the secret-backed configuration.
+      matrix: ${{ steps.groups.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup SSH via Cloudflare Tunnel
+        uses: ./.github/actions/setup-ssh-tunnel
+        with:
+          ssh-key: ${{ secrets.AWS_METAL_RUNNER_SSH_KEY }}
+          cf-access-client-id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          cf-access-client-secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+
+      - name: Resolve runner host architecture groups
+        id: groups
+        env:
+          AWS_METAL_RUNNER_HOSTS: ${{ secrets.AWS_METAL_RUNNER_HOSTS }}
+          METAL_USER: ${{ vars.AWS_METAL_RUNNER_USER }}
+        run: |
+          MATRIX=$(.github/scripts/runner-host-architecture-groups.sh matrix)
+          GROUP_COUNT=$(jq -r 'length' <<<"$MATRIX")
+          if [ "$GROUP_COUNT" -lt 1 ]; then
+            echo "::error::No runner host architecture groups found"
+            exit 1
+          fi
+
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+
+          echo "Runner host architecture groups:"
+          jq . <<<"$MATRIX"
+
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: ghcr.io/vm0-ai/vm0-toolchain-rust:20260622
+    needs: [detect]
+    if: needs.detect.outputs.any-changed == 'true'
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates -> target
+          shared-key: check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check formatting
+        run: |
+          cd crates
+          cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: |
+          cd crates
+          cargo clippy --all-targets --all-features
+
+      - name: Build documentation
+        run: |
+          cd crates
+          cargo doc --workspace --all-features --no-deps
+
+      - name: Run ably-subscriber smoke test
+        if: |
+          needs.detect.outputs.ably-subscriber-changed == 'true' ||
+          needs.detect.outputs.ci-changed == 'true'
+        env:
+          ABLY_API_KEY: ${{ secrets.ABLY_API_KEY }}
+        run: |
+          cd crates
+          cargo run -p ably-subscriber --example smoke_test
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    container:
+      image: ghcr.io/vm0-ai/vm0-toolchain-rust:20260622
+    needs: [detect]
+    if: needs.detect.outputs.any-changed == 'true'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+        with:
+          workspaces: crates -> target
+          shared-key: coverage-line-tables-only
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Report coverage disk usage after cache restore
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          for path in crates/target crates/target/llvm-cov-target; do
+            if [ -e "$path" ]; then
+              du -sh "$path"
+            else
+              echo "$path: not present"
+            fi
+          done
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Run tests with coverage
+        run: |
+          cd crates
+          cargo llvm-cov --all-targets --all-features --lcov --output-path lcov.info
+
+      - name: Report final coverage disk usage
+        if: success() || failure()
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          for path in crates/target crates/target/llvm-cov-target; do
+            if [ -e "$path" ]; then
+              du -sh "$path"
+            else
+              echo "$path: not present"
+            fi
+          done
+
+      - name: Upload coverage to Codecov
+        if: success() || failure()
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: crates/lcov.info
+          flags: rust
+
+  api-contracts-rust-bindings:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/vm0-ai/vm0-toolchain:20260622
+    needs: [detect]
+    if: |
+      needs.detect.outputs.ci-changed == 'true' ||
+      needs.detect.outputs.api-contracts-rust-bindings-changed == 'true'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain-init
+      - name: Check API Contracts Rust Bindings
+        working-directory: turbo
+        run: |
+          pnpm -F @vm0/api-contracts generate:rust
+          git diff --exit-code -- ../crates/api-contracts/src/generated
+
+  mitm-addon-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [detect]
+    if: |
+      needs.detect.outputs.any-changed == 'true' ||
+      needs.detect.outputs.mitm-addon-test-inputs-changed == 'true' ||
+      needs.detect.outputs.mitm-addon-pricing-seed-changed == 'true'
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Lint and format check
+        run: |
+          cd crates/runner/mitm-addon
+          pip install ".[dev]"
+          ruff check .
+          ruff format --check .
+          basedpyright -p .
+
+      - name: Run mitm-addon tests
+        run: |
+          cd crates/runner/mitm-addon
+          pip install ".[test]"
+          python -m pytest tests/ -v
+
+  nbd-cow-test:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/vm0-ai/vm0-toolchain-rust:20260622
+    needs: [detect, runner-host-groups]
+    if: |
+      needs.detect.outputs.metal-job-ref != '' && (
+        needs.detect.outputs.ci-changed == 'true' ||
+        needs.detect.outputs.nbd-cow-changed == 'true'
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.runner-host-groups.outputs.matrix || '[]') }}
+    timeout-minutes: 5
+    env:
+      TARGET_TRIPLE: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates -> target
+          # Separate key from runner-build to avoid cache reservation race (#9447)
+          shared-key: ${{ matrix.cacheSuffix }}-nbd
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Cross-compile nbd-cow tests for ${{ matrix.label }}
+        run: |
+          cd crates
+          cargo test --no-run --release --target "$TARGET_TRIPLE" -p nbd-cow
+          TEST_BIN=$(find "target/$TARGET_TRIPLE/release/deps" -name "integration-*" -executable -type f | head -1)
+          cp "$TEST_BIN" "target/nbd-cow-integration-test"
+          echo "TEST_BIN=crates/target/nbd-cow-integration-test" >> "$GITHUB_ENV"
+
+      - name: Setup SSH via Cloudflare Tunnel
+        uses: ./.github/actions/setup-ssh-tunnel
+        with:
+          ssh-key: ${{ secrets.AWS_METAL_RUNNER_SSH_KEY }}
+          cf-access-client-id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          cf-access-client-secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+
+      - name: Select metal host
+        id: selected-host
+        env:
+          AWS_METAL_RUNNER_HOSTS: ${{ secrets.AWS_METAL_RUNNER_HOSTS }}
+          METAL_USER: ${{ vars.AWS_METAL_RUNNER_USER }}
+          RUNNER_HOST_GROUP_ID: ${{ matrix.id }}
+          JOB_REF: ${{ needs.detect.outputs.metal-job-ref }}
+        run: |
+          HOSTS=$(.github/scripts/runner-host-architecture-groups.sh hosts "$RUNNER_HOST_GROUP_ID")
+          NUM_HOSTS=$(printf '%s\n' "$HOSTS" | tr ',' '\n' | grep -c . || true)
+          if [ "$NUM_HOSTS" -lt 1 ]; then
+            echo "::error::No metal hosts found for runner host group $RUNNER_HOST_GROUP_ID"
+            exit 1
+          fi
+          HOST=$(.github/scripts/runner-host-architecture-groups.sh select-host "$RUNNER_HOST_GROUP_ID" "$JOB_REF" "$HOSTS")
+          echo "host=${HOST}" >> "$GITHUB_OUTPUT"
+          echo "Selected $RUNNER_HOST_GROUP_ID metal host: ${HOST} (${NUM_HOSTS} host(s) in group)"
+
+      - name: Run nbd-cow integration tests on metal
+        env:
+          METAL_USER: ${{ vars.AWS_METAL_RUNNER_USER }}
+          HOST: ${{ steps.selected-host.outputs.host }}
+          JOB_REF: ${{ needs.detect.outputs.metal-job-ref }}
+          RUNNER_HOST_GROUP_ID: ${{ matrix.id }}
+        run: |
+          REMOTE="${METAL_USER}@${HOST}"
+          REMOTE_BIN="/tmp/nbd-cow-test-${JOB_REF}-${RUNNER_HOST_GROUP_ID}"
+          scp "$TEST_BIN" "${REMOTE}:${REMOTE_BIN}"
+          # shellcheck disable=SC2029
+          ssh "$REMOTE" "trap 'rm -f ${REMOTE_BIN}' EXIT && sudo modprobe nbd nbds_max=4096 && sudo ${REMOTE_BIN} --ignored --test-threads=1"
+
+  runner-build:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    needs: [detect, runner-host-groups]
+    if: |
+      needs.detect.outputs.metal-job-ref != '' &&
+      needs.detect.outputs.crates-runner-consumer-needed == 'true'
+    timeout-minutes: 20
+    outputs:
+      host: ${{ steps.selected-host.outputs.host }}
+      job-ref: ${{ needs.detect.outputs.metal-job-ref }}
+      image-job-ref: ${{ needs.detect.outputs.runner-image-job-ref }}
+      bin-dir: ${{ steps.manifest.outputs.bin-dir }}
+      default-rootfs-hash: ${{ steps.manifest.outputs.selected-rootfs-hash }}
+      default-snapshot-hash: ${{ steps.manifest.outputs.selected-snapshot-hash }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup SSH via Cloudflare Tunnel
+        uses: ./.github/actions/setup-ssh-tunnel
+        with:
+          ssh-key: ${{ secrets.AWS_METAL_RUNNER_SSH_KEY }}
+          cf-access-client-id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          cf-access-client-secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+
+      - name: Select runner metal host
+        id: selected-host
+        env:
+          AWS_METAL_RUNNER_HOSTS: ${{ secrets.AWS_METAL_RUNNER_HOSTS }}
+          METAL_USER: ${{ vars.AWS_METAL_RUNNER_USER }}
+          SELECTION_KEY: ${{ needs.detect.outputs.runner-image-job-ref }}
+        run: |
+          CONTEXT=$(.github/scripts/runner-host-architecture-groups.sh select-context "$SELECTION_KEY")
+          HOST=$(jq -r '.host' <<<"$CONTEXT")
+          GROUP_ID=$(jq -r '.groupId' <<<"$CONTEXT")
+          TARGET=$(jq -r '.target' <<<"$CONTEXT")
+          HOSTS=$(jq -r '.groupHosts' <<<"$CONTEXT")
+          {
+            echo "host=${HOST}"
+            echo "hosts=${HOSTS}"
+            echo "target=${TARGET}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Selected runner metal host: ${HOST} (group ${GROUP_ID}, target ${TARGET})"
+
+      - name: Wait for runner image manifest
+        id: manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.sha }}
+          LOOKUP_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          JOB_REF: ${{ needs.detect.outputs.runner-image-job-ref }}
+          # Target-specific manifests only contain hosts for that architecture group.
+          METAL_HOSTS: ${{ steps.selected-host.outputs.hosts }}
+          SELECTED_HOST: ${{ steps.selected-host.outputs.host }}
+          TARGET: ${{ steps.selected-host.outputs.target }}
+          PROFILE: vm0/default
+        run: .github/scripts/wait-runner-image.sh
+
+  runner-image-architecture-manifest:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    needs: [detect, runner-host-groups]
+    if: |
+      needs.detect.outputs.metal-job-ref != '' &&
+      needs.detect.outputs.crates-runner-consumer-needed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.runner-host-groups.outputs.matrix || '[]') }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup SSH via Cloudflare Tunnel
+        uses: ./.github/actions/setup-ssh-tunnel
+        with:
+          ssh-key: ${{ secrets.AWS_METAL_RUNNER_SSH_KEY }}
+          cf-access-client-id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          cf-access-client-secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+
+      - name: Resolve metal hosts
+        id: hosts
+        env:
+          AWS_METAL_RUNNER_HOSTS: ${{ secrets.AWS_METAL_RUNNER_HOSTS }}
+          METAL_USER: ${{ vars.AWS_METAL_RUNNER_USER }}
+          RUNNER_HOST_GROUP_ID: ${{ matrix.id }}
+        run: |
+          HOSTS=$(.github/scripts/runner-host-architecture-groups.sh hosts "$RUNNER_HOST_GROUP_ID")
+          if ! printf '%s\n' "$HOSTS" | grep -q .; then
+            echo "::error::No metal hosts found for runner host group $RUNNER_HOST_GROUP_ID"
+            exit 1
+          fi
+          {
+            echo "hosts<<HOSTS"
+            echo "$HOSTS"
+            echo "HOSTS"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Wait for runner image manifest for ${{ matrix.label }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.sha }}
+          LOOKUP_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          JOB_REF: ${{ needs.detect.outputs.runner-image-job-ref }}
+          METAL_HOSTS: ${{ steps.hosts.outputs.hosts }}
+          TARGET: ${{ matrix.target }}
+          PROFILE: vm0/default
+        run: .github/scripts/wait-runner-image.sh
+
+  # Cap these runner behavior scenarios at two concurrent metal-host users.
+  # Run balloon first in lane A and exec last in lane B to stagger the two
+  # heaviest scenarios during normal runs.
+  runner-behavior-lane-a:
+    runs-on: ubuntu-latest
+    needs: [runner-build]
+    timeout-minutes: 35
+    env:
+      METAL_USER: ${{ vars.AWS_METAL_RUNNER_USER }}
+      HOST: ${{ needs.runner-build.outputs.host }}
+      JOB_REF: ${{ needs.runner-build.outputs.job-ref }}
+      BIN_DIR: ${{ needs.runner-build.outputs.bin-dir }}
+      DEFAULT_ROOTFS_HASH: ${{ needs.runner-build.outputs.default-rootfs-hash }}
+      DEFAULT_SNAPSHOT_HASH: ${{ needs.runner-build.outputs.default-snapshot-hash }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup SSH via Cloudflare Tunnel
+        uses: ./.github/actions/setup-ssh-tunnel
+        with:
+          ssh-key: ${{ secrets.AWS_METAL_RUNNER_SSH_KEY }}
+          cf-access-client-id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          cf-access-client-secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+
+      - name: Test balloon memory reclaim
+        id: balloon
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          OFFICIAL_RUNNER_SECRET: ${{ secrets.OFFICIAL_RUNNER_SECRET }}
+        run: .github/scripts/runner-behavior-balloon.sh
+
+      - name: Test local active input with real Claude Code
+        id: local_claude_active_input_smoke
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          OFFICIAL_RUNNER_SECRET: ${{ secrets.OFFICIAL_RUNNER_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.CI_ANTHROPIC_API_KEY }}
+        run: .github/scripts/runner-behavior-local-claude-active-input-smoke.sh
+
+      - name: Test local active input with real Codex
+        id: local_codex_active_input_smoke
+        timeout-minutes: 8
+        continue-on-error: true
+        env:
+          OFFICIAL_RUNNER_SECRET: ${{ secrets.OFFICIAL_RUNNER_SECRET }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: .github/scripts/runner-behavior-local-codex-active-input-smoke.sh
+
+      - name: Run benchmark
+        id: benchmark
+        timeout-minutes: 8
+        continue-on-error: true
+        env:
+          OFFICIAL_RUNNER_SECRET: ${{ secrets.OFFICIAL_RUNNER_SECRET }}
+        run: .github/scripts/runner-behavior-benchmark.sh
+
+      - name: Summarize runner behavior lane A results
+        env:
+          BALLOON_RESULT: ${{ steps.balloon.outcome }}
+          LOCAL_CLAUDE_ACTIVE_INPUT_SMOKE_RESULT: ${{ steps.local_claude_active_input_smoke.outcome }}
+          LOCAL_CODEX_ACTIVE_INPUT_SMOKE_RESULT: ${{ steps.local_codex_active_input_smoke.outcome }}
+          BENCHMARK_RESULT: ${{ steps.benchmark.outcome }}
+        run: |
+          FAILED=0
+
+          check_result() {
+            local name=$1 result=$2
+            if [ "$result" = "success" ]; then
+              echo "✅ $name: $result"
+            else
+              echo "::error::$name: expected success, got ${result:-missing}"
+              FAILED=1
+            fi
+          }
+
+          echo "::group::Runner Behavior Lane A Results"
+          check_result "balloon" "$BALLOON_RESULT"
+          check_result "local-claude-active-input-smoke" "$LOCAL_CLAUDE_ACTIVE_INPUT_SMOKE_RESULT"
+          check_result "local-codex-active-input-smoke" "$LOCAL_CODEX_ACTIVE_INPUT_SMOKE_RESULT"
+          check_result "benchmark" "$BENCHMARK_RESULT"
+          echo "::endgroup::"
+
+          exit "$FAILED"
+
+  runner-behavior-lane-b:
+    runs-on: ubuntu-latest
+    needs: [runner-build]
+    timeout-minutes: 35
+    env:
+      METAL_USER: ${{ vars.AWS_METAL_RUNNER_USER }}
+      HOST: ${{ needs.runner-build.outputs.host }}
+      JOB_REF: ${{ needs.runner-build.outputs.job-ref }}
+      BIN_DIR: ${{ needs.runner-build.outputs.bin-dir }}
+      DEFAULT_ROOTFS_HASH: ${{ needs.runner-build.outputs.default-rootfs-hash }}
+      DEFAULT_SNAPSHOT_HASH: ${{ needs.runner-build.outputs.default-snapshot-hash }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup SSH via Cloudflare Tunnel
+        uses: ./.github/actions/setup-ssh-tunnel
+        with:
+          ssh-key: ${{ secrets.AWS_METAL_RUNNER_SSH_KEY }}
+          cf-access-client-id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          cf-access-client-secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+
+      - name: Test runner local cancel
+        id: cancel
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          OFFICIAL_RUNNER_SECRET: ${{ secrets.OFFICIAL_RUNNER_SECRET }}
+        run: .github/scripts/runner-behavior-cancel.sh
+
+      - name: Test VM keep-alive across conversation turns
+        id: keep_alive
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          OFFICIAL_RUNNER_SECRET: ${{ secrets.OFFICIAL_RUNNER_SECRET }}
+        run: .github/scripts/runner-behavior-keep-alive.sh
+
+      - name: Test runner service drain + resume
+        id: drain_resume
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          OFFICIAL_RUNNER_SECRET: ${{ secrets.OFFICIAL_RUNNER_SECRET }}
+        run: .github/scripts/runner-behavior-drain-resume.sh
+
+      - name: Run upgrade test
+        id: upgrade_local
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          OFFICIAL_RUNNER_SECRET: ${{ secrets.OFFICIAL_RUNNER_SECRET }}
+        run: .github/scripts/runner-behavior-upgrade-local.sh
+
+      - name: Test runner exec
+        id: exec
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          OFFICIAL_RUNNER_SECRET: ${{ secrets.OFFICIAL_RUNNER_SECRET }}
+        run: .github/scripts/runner-behavior-exec.sh
+
+      - name: Summarize runner behavior lane B results
+        env:
+          CANCEL_RESULT: ${{ steps.cancel.outcome }}
+          KEEP_ALIVE_RESULT: ${{ steps.keep_alive.outcome }}
+          DRAIN_RESUME_RESULT: ${{ steps.drain_resume.outcome }}
+          UPGRADE_LOCAL_RESULT: ${{ steps.upgrade_local.outcome }}
+          EXEC_RESULT: ${{ steps.exec.outcome }}
+        run: |
+          FAILED=0
+
+          check_result() {
+            local name=$1 result=$2
+            if [ "$result" = "success" ]; then
+              echo "✅ $name: $result"
+            else
+              echo "::error::$name: expected success, got ${result:-missing}"
+              FAILED=1
+            fi
+          }
+
+          echo "::group::Runner Behavior Lane B Results"
+          check_result "cancel" "$CANCEL_RESULT"
+          check_result "keep-alive" "$KEEP_ALIVE_RESULT"
+          check_result "drain-resume" "$DRAIN_RESUME_RESULT"
+          check_result "upgrade-local" "$UPGRADE_LOCAL_RESULT"
+          check_result "exec" "$EXEC_RESULT"
+          echo "::endgroup::"
+
+          exit "$FAILED"
+
+  ci-gate-crates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs:
+      - detect-release
+      - detect
+      - check
+      - coverage
+      - api-contracts-rust-bindings
+      - mitm-addon-test
+      - runner-host-groups
+      - runner-build
+      - runner-image-architecture-manifest
+      - runner-behavior-lane-a
+      - runner-behavior-lane-b
+      - nbd-cow-test
+    # Always run so the gate reports an explicit result (not "skipped").
+    if: always()
+    steps:
+      - name: Validate CI results
+        env:
+          IS_RELEASE: ${{ needs.detect-release.outputs.skip }}
+        run: |
+          # Auto-pass for release-please PRs, commits, and merge queue entries
+          if [[ "$IS_RELEASE" == "true" ]]; then
+            echo "✅ Release-please — skipping CI gate"
+            exit 0
+          fi
+          echo "::group::CI Gate Results"
+          FAILED=0
+
+          check_result() {
+            local job="$1" result="$2" allow_skip="$3"
+            if [ "$result" = "success" ]; then
+              echo "✅ $job: $result"
+            elif [ "$allow_skip" = "true" ] && [ "$result" = "skipped" ]; then
+              echo "⏭️ $job: $result (allowed)"
+            elif [ "$allow_skip" = "informational" ]; then
+              echo "ℹ️ $job: $result (informational, not blocking)"
+            else
+              if [ "$allow_skip" = "true" ]; then
+                echo "::error::$job: expected success or skipped, got $result"
+              else
+                echo "::error::$job: expected success, got $result"
+              fi
+              FAILED=1
+            fi
+          }
+
+          # Must-succeed: only 'success' is acceptable
+          check_result "detect" "${{ needs.detect.result }}" ""
+
+          # May-skip: only run when relevant crates change
+          check_result "check" "${{ needs.check.result }}" "true"
+          check_result "coverage" "${{ needs.coverage.result }}" "true"
+          check_result "api-contracts-rust-bindings" "${{ needs.api-contracts-rust-bindings.result }}" "true"
+          check_result "mitm-addon-test" "${{ needs.mitm-addon-test.result }}" "true"
+          check_result "runner-host-groups" "${{ needs.runner-host-groups.result }}" "true"
+          check_result "runner-build" "${{ needs.runner-build.result }}" "true"
+          check_result "runner-image-architecture-manifest" "${{ needs.runner-image-architecture-manifest.result }}" "true"
+          check_result "runner-behavior-lane-a" "${{ needs.runner-behavior-lane-a.result }}" "true"
+          check_result "runner-behavior-lane-b" "${{ needs.runner-behavior-lane-b.result }}" "true"
+          check_result "nbd-cow-test" "${{ needs.nbd-cow-test.result }}" "true"
+
+          echo "::endgroup::"
+          exit $FAILED

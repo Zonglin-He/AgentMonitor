@@ -1,0 +1,7056 @@
+import type {
+  CSSProperties,
+  FormEvent,
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
+  ReactNode,
+  UIEvent as ReactUIEvent,
+} from "react";
+import { createPortal } from "react-dom";
+import {
+  useGet,
+  useSet,
+  useLastLoadable,
+  useLastResolved,
+  useLoadable,
+} from "ccstate-react";
+import { equalArrays } from "../../lib/equality.ts";
+import { useLoadableSet } from "ccstate-react/experimental";
+import { pageSignal$ } from "../../signals/page-signal.ts";
+import { rootSignal$ } from "../../signals/root-signal.ts";
+import {
+  runUsagePopoverOpenRunId$,
+  setRunUsagePopoverOpenRunId$,
+} from "../../signals/chat-page/run-usage-popover.ts";
+import {
+  replaceWorkflowPromptDraftTarget$,
+  setReplaceWorkflowPromptDraftTarget$,
+} from "../../signals/chat-page/workflow-prompt-action.ts";
+import {
+  IconAlertCircle,
+  IconArrowsDiagonal,
+  IconArrowsDiagonalMinimize2,
+  IconHandStop,
+  IconPhoto,
+  IconChartLine,
+  IconPlayerPlay,
+  IconPlayerPause,
+  IconVideo,
+  IconCopy,
+  IconDeviceDesktop,
+  IconCheck,
+  IconArrowDown,
+  IconArrowUpRight,
+  IconChevronRight,
+  IconLink,
+  IconLoader2,
+  IconMessageCircle,
+  IconMoodPlus,
+  IconPackage,
+  IconPresentation,
+  IconRoute,
+  IconSearch,
+  IconTarget,
+  IconX,
+  IconClock,
+  IconCoins,
+  IconHourglass,
+  IconWorld,
+} from "@tabler/icons-react";
+import {
+  cn,
+  getShortcutLabel,
+  getShortcutParts,
+  Button,
+  Input,
+  Skeleton,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@vm0/ui";
+import { RUN_ERROR_GUIDANCE } from "@vm0/api-contracts/contracts/errors";
+import type {
+  ChatThreadArtifactFile,
+  ChatMessageUsagePayload,
+  GenerationTemplateRequest,
+} from "@vm0/api-contracts/contracts/chat-threads";
+import type {
+  ChatThreadWorkflowAutomation,
+  ZeroWorkflowSchedule,
+} from "@vm0/api-contracts/contracts/zero-workflows";
+import {
+  ILLUSTRATION_TEMPLATE_ITEMS,
+  PRESENTATION_TEMPLATE_PICKER_ITEMS,
+  findWebsiteTemplateItem,
+  findVideoTemplateItem,
+  findWorkflowTemplateItem,
+  r2ImageTransformUrl,
+} from "@vm0/core";
+import { getModelDisplayName } from "@vm0/core/model-display-name";
+import type {
+  UserPermissionGrantExpiresIn,
+  UserPermissionGrantResponse,
+} from "@vm0/api-contracts/contracts/zero-user-permission-grants";
+import type { PublicConnectorCatalogPermissionDetail } from "@vm0/api-contracts/contracts/zero-connector-catalog";
+import { emptyArtifactImg, emptyChatImg } from "./platform-assets.ts";
+import type { FirewallPolicyValue } from "@vm0/connectors/firewall-types";
+import { Markdown } from "../components/markdown.tsx";
+import { detach, Reason } from "../../signals/utils.ts";
+import {
+  captureRecommendedFollowupSelected,
+  captureRecommendedFollowupsShown,
+} from "../../lib/posthog.ts";
+import {
+  AttachmentLightbox,
+  FileAttachmentChip,
+  PreviewableAudioAttachmentChip,
+  PreviewableFileAttachmentChip,
+  publicAttachmentUrl,
+} from "./zero-attachment-chips.tsx";
+import { ArtifactSidebar } from "./zero-artifact-sidebar.tsx";
+import { PresentationHtmlEditor } from "./presentation-html-editor.tsx";
+import { MailDraftCard } from "./mail-draft-card.tsx";
+import {
+  classifyChatAttachment,
+  contentTypeForBodyPreviewKind,
+  enrichBlocksWithTextPreviews,
+  parseBodyRenderBlocks,
+  type BodyRenderBlock,
+} from "../../signals/chat-page/parse-body-blocks.ts";
+import {
+  activeChatConnectorAction$,
+  closeChatConnectorActionConnectDialog$,
+  completeChatConnectorActionConnect$,
+  type CustomConnectorActionBlock,
+  type ConnectorActionBlock,
+} from "../../signals/chat-page/connector-action-block.ts";
+import {
+  completedWorkExpandedKeys$,
+  toggleCompletedWorkExpanded$,
+} from "../../signals/chat-page/completed-work-folding.ts";
+import {
+  buildRunGroupFolding,
+  runGroupExpandedKeys$,
+  toggleRunGroupExpanded$,
+  type RunGroupFold,
+  type RunGroupFolding,
+} from "../../signals/chat-page/run-group-folding.ts";
+import type { PermissionActionBlock } from "../../signals/chat-page/permission-action-block.ts";
+import type { ComputerUseAuthorizationBlock } from "../../signals/chat-page/computer-use-authorization-block.ts";
+import { AttachmentPreview } from "./zero-attachment-preview.tsx";
+import { FilePreviewIcon } from "./zero-file-preview-icon.tsx";
+import { ConnectorIcon } from "./components/settings/connector-icons.tsx";
+import { ConnectModal } from "./components/settings/add-connection-dialog.tsx";
+import { PermissionGrantDurationSelect } from "../components/permission-grant-duration-select.tsx";
+import { lightboxUrl$ as attachmentLightboxUrl$ } from "../../signals/zero-page/zero-attachment-chips.ts";
+import {
+  DEFAULT_USER_PERMISSION_GRANT_EXPIRES_IN,
+  permissionGrantExpiresInByScope$,
+  permissionGrantExpiryText,
+  setPermissionGrantExpiresIn$,
+} from "../../signals/permission-allow/permission-grant-expiration.ts";
+import { isActiveUserPermissionGrant } from "../../signals/user-permission-grants.ts";
+import { useUserPermissionGrantExpiryTick } from "../user-permission-grant-expiry-tick.ts";
+import {
+  artifactFullscreen$,
+  artifactInboxQuery$,
+  artifactInboxSearchOpen$,
+  artifactInboxSection$,
+  ARTIFACT_PANEL_MIN_THREAD_WIDTH,
+  ARTIFACT_PANEL_MIN_WIDTH,
+  artifactPanelResizing$,
+  artifactPanelWidth$,
+  backToArtifactInbox$,
+  type ArtifactInboxSection,
+  type ArtifactRef,
+  closeArtifact$,
+  closePresentationEditor$,
+  currentArtifactInboxThreadId$,
+  currentArtifactRef$,
+  currentPresentationEditorUrl$,
+  openArtifactFromInbox$,
+  openArtifactInbox$,
+  setArtifactInboxQuery$,
+  setArtifactInboxSection$,
+  setArtifactPanelResizing$,
+  setArtifactPanelWidth$,
+  openImageLightboxOrArtifact$ as openAttachmentImageLightbox$,
+  openVideoLightboxOrArtifact$ as openAttachmentVideoLightbox$,
+  toggleArtifactFullscreen$,
+  toggleArtifactInboxSearch$,
+} from "../../signals/zero-page/zero-artifact-sidebar.ts";
+import type { ChatClipboardAttachment } from "../../signals/zero-page/clipboard.ts";
+import { toast } from "@vm0/ui/components/ui/sonner";
+import {
+  headerWorkflowAutomationsForThread,
+  runHeaderWorkflowAutomationNow$,
+  reloadHeaderAutomationMenu$,
+  updateHeaderWorkflowGmailLabelAppliedAutomation$,
+  updateHeaderWorkflowGmailNewMessageAutomation$,
+  updateHeaderWorkflowScheduleAutomation$,
+  type HeaderWorkflowAutomationEntry,
+} from "../../signals/chat-page/header-automation-menu.ts";
+import { pauseChatThreadGoal$ } from "../../signals/chat-page/chat-goal.ts";
+import {
+  closeHeaderAutomationSidebar$,
+  currentEditingHeaderWorkflowAutomationId$,
+  currentHeaderAutomationThreadId$,
+  openHeaderAutomationSidebar$,
+  setEditingHeaderWorkflowAutomationId$,
+} from "../../signals/chat-page/header-automation-sidebar.ts";
+import {
+  clearWorkflowQueue$,
+  setWorkflowQueuePaused$,
+  skipWorkflowQueueEvent$,
+  workflowQueueForThread,
+} from "../../signals/chat-page/workflow-queue.ts";
+import { openQueueDrawer$ } from "../../signals/queue-page/queue-drawer-state.ts";
+import {
+  closeChatThreadEmojiMenu$,
+  emojiMenuThreadId$,
+  emojiMenuTitle$,
+  openChatThreadEmojiMenu$,
+} from "../../signals/zero-page/zero-sidebar-state.ts";
+import { Link } from "../router/link.tsx";
+import { ROUTES } from "../../signals/route-paths.ts";
+import {
+  atTimeInTimezone,
+  cronWallTimeInTimezone,
+} from "../../signals/zero-page/cron.ts";
+import {
+  buildGmailLabelAppliedEventConfig,
+  buildGmailNewMessageEventConfig,
+  formatWorkflowIntervalSeconds,
+  GMAIL_TEXT_FIELDS,
+  getWorkflowIntervalSecondOptions,
+  gmailMatcherDefaultValue,
+  gmailAutomationSummary,
+  gmailAutomationTitle,
+} from "../workflows-page/workflow-shared.tsx";
+import {
+  WorkflowAutomationCard,
+  type WorkflowAutomationCardRow,
+} from "../workflows-page/workflow-automation-card.tsx";
+import { CREATE_WORKFLOW_WITH_CHAT_PROMPT } from "./workflow-chat-prompts.ts";
+import { ReplaceComposerDraftDialog } from "./replace-composer-draft-dialog.tsx";
+
+import {
+  renameChatThread$,
+  type EnrichedChatMessage,
+  type GroupedChatMessageGroup,
+  type PagedChatMessage,
+} from "../../signals/chat-page/chat-message.ts";
+import type {
+  ChatThreadSignals,
+  QueuedChatMessageItem,
+  RecommendedFollowupSource,
+  ThinkingIndicatorMode,
+} from "../../signals/chat-page/chat-thread-signals.ts";
+import {
+  applyChatThreadEmoji,
+  removeChatThreadEmoji,
+  CHAT_THREAD_EMOJI_OPTIONS,
+} from "../../signals/chat-page/chat-thread-title.ts";
+import {
+  chatThreadEmojiGroups$,
+  chatThreadEmojiQuery$,
+  filterChatThreadEmojiGroups,
+  setChatThreadEmojiQuery$,
+  type ChatThreadEmojiItem,
+} from "../../signals/chat-page/chat-thread-emoji.ts";
+import { openRenameChatThreadDialogForThreadId$ } from "../../signals/chat-page/chat-thread-rename.ts";
+import type { ChatThread } from "../../signals/agent-chat.ts";
+import { ATTACH_ONLY_PLACEHOLDER } from "../../signals/chat-page/resolve-draft-attachments.ts";
+import {
+  useZeroChatComposer,
+  type ZeroChatComposerProps,
+  type QueuedComposerItem,
+  type ComposerFeedback,
+} from "./zero-chat-composer.tsx";
+import { ChatFeedbackSelection } from "./zero-chat-feedback-selection.tsx";
+import {
+  feedbackItemsValue$,
+  feedbackThreadIdValue$,
+  feedbackSendCountValue$,
+  setFeedbackItemNote$,
+  removeFeedbackItem$,
+  submitFeedback$,
+  dismissFeedback$,
+} from "../../signals/zero-page/chat-feedback.ts";
+import {
+  computerUseHosts$,
+  selectedComputerUseHostId as resolveSelectedComputerUseHostId,
+  visibleComputerUseHosts,
+  ZERO_DESKTOP_DOWNLOAD_URL,
+} from "../../signals/zero-page/computer-use-hosts.ts";
+import type { ModelProviderSelection } from "./components/model-provider-picker.tsx";
+import { AgentAvatarImg } from "./zero-sidebar-shared.tsx";
+import { setOrgManageDialogOpen$ } from "../../signals/zero-page/settings/org-manage-dialog.ts";
+import {
+  setActiveOrgManageTab$,
+  setBillingSubPage$,
+} from "../../signals/zero-page/settings/org-manage-tabs-state.ts";
+import { isOrgAdmin$ } from "../../signals/org.ts";
+import { agentById } from "../../signals/agent.ts";
+import {
+  applyUserPermissionGrant$,
+  findPermissionInMetadata,
+  resolveUserPermissionGrantPolicy,
+  userPermissionGrantsByAgent,
+} from "../../signals/permission-allow/permission-allow-signals.ts";
+import { firewallPermissionMetadataByConnector } from "../../signals/firewall-permission-metadata.ts";
+import {
+  billingStatusAsync$,
+  type CreditCheckoutSelection,
+  startCheckout$,
+  startCreditCheckout$,
+} from "../../signals/zero-page/billing.ts";
+import {
+  imageLoadStatusByKey$,
+  imageLoadStatusRef$,
+  setImageLoadStatus$,
+} from "../../signals/view-component-state.ts";
+import {
+  currentLeftThread$,
+  currentRightThread$,
+} from "../../signals/chat-page/chat-thread-panes.ts";
+import {
+  focusChatThreadContainer$,
+  setChatKeyboardScrollRoot$,
+  setMainChatThreadKeyboardFocusRef$,
+} from "../../signals/chat-page/chat-keyboard.ts";
+import { PersonalClaudeCodeDeviceAuthDialog } from "./components/settings/claude-code-device-auth-dialog.tsx";
+import { PersonalCodexDeviceAuthDialog } from "./components/settings/codex-device-auth-dialog.tsx";
+
+type RecommendedFollowup = NonNullable<
+  Extract<PagedChatMessage, { role: "assistant" }>["recommendedFollowups"]
+>[number];
+
+function ArtifactsButton({ thread }: { thread: ChatThreadSignals }) {
+  return <ArtifactsButtonInner thread={thread} />;
+}
+
+function ArtifactsButtonInner({ thread }: { thread: ChatThreadSignals }) {
+  const inboxThreadId = useGet(currentArtifactInboxThreadId$);
+  const reloadArtifacts = useSet(thread.reloadArtifacts$);
+  const openInbox = useSet(openArtifactInbox$);
+  const open = inboxThreadId === thread.threadId;
+
+  return (
+    <TooltipProvider delayDuration={300}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            onClick={() => {
+              reloadArtifacts();
+              openInbox(thread.threadId);
+            }}
+            className={cn(
+              "inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md transition-colors duration-150",
+              open
+                ? "bg-primary/10 text-primary"
+                : "text-muted-foreground/70 hover:bg-accent hover:text-foreground",
+            )}
+            aria-label="Open artifacts"
+            aria-pressed={open}
+          >
+            <IconPackage size={17} stroke={1.5} />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">Open artifacts</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+// Loads automations and only renders once this thread has at least one linked
+// automation.
+export function AutomationMenuButton({
+  threadId,
+  ariaLabel = "Automations",
+}: {
+  threadId: string;
+  ariaLabel?: string;
+}) {
+  const reloadAutomations = useSet(reloadHeaderAutomationMenu$);
+  const openAutomationSidebar = useSet(openHeaderAutomationSidebar$);
+  const openThreadId = useGet(currentHeaderAutomationThreadId$);
+  const workflowAutomations$ = headerWorkflowAutomationsForThread(threadId);
+  const workflowAutomationsLoadable = useLastLoadable(workflowAutomations$);
+  const lastResolvedAutomations = useLastResolved(workflowAutomations$);
+  const workflowAutomations =
+    workflowAutomationsLoadable.state === "hasData"
+      ? workflowAutomationsLoadable.data
+      : (lastResolvedAutomations ?? []);
+  const queue = useLastResolved(workflowQueueForThread(threadId));
+  const pendingCount = queue?.pending.length ?? 0;
+  const open = openThreadId === threadId;
+
+  // Show the opener when the thread has a workflow automation.
+  // Goals live in the composer, so a goal-only thread has nothing here.
+  if (workflowAutomations.length === 0) {
+    return null;
+  }
+
+  return (
+    <TooltipProvider delayDuration={300}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            className={cn(
+              "relative inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md transition-colors duration-150",
+              open
+                ? "bg-primary/10 text-primary"
+                : "text-muted-foreground/70 hover:bg-accent hover:text-foreground",
+            )}
+            aria-label={ariaLabel}
+            aria-pressed={open}
+            onClick={() => {
+              reloadAutomations();
+              openAutomationSidebar(threadId);
+            }}
+          >
+            <IconClock size={18} />
+            {pendingCount > 0 ? (
+              <span
+                className="absolute -right-1 -top-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-medium leading-none text-primary-foreground"
+                data-testid="workflow-queue-badge"
+              >
+                {pendingCount > 99 ? "99+" : pendingCount}
+              </span>
+            ) : null}
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">Open automations</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+function ChatThreadHeader({ thread }: { thread: ChatThreadSignals }) {
+  const threadTitleLoadable = useLastLoadable(thread.threadTitle$);
+  const threadTitleEmoji = useLastResolved(thread.threadTitleEmoji$);
+  const threadTitleText = useLastResolved(thread.threadTitleText$) ?? "";
+  const openRenameChatThreadDialog = useSet(
+    openRenameChatThreadDialogForThreadId$,
+  );
+  const pageSignal = useGet(pageSignal$);
+  const threadTitle =
+    threadTitleLoadable.state === "hasData"
+      ? (threadTitleLoadable.data?.trim() ?? "")
+      : "";
+
+  function openRenameDialog(event: ReactMouseEvent<HTMLSpanElement>) {
+    event.preventDefault();
+    detach(
+      openRenameChatThreadDialog(thread.threadId, pageSignal),
+      Reason.DomCallback,
+    );
+  }
+
+  return (
+    <header className="hidden sm:flex shrink-0 bg-transparent px-6 py-3 items-center justify-between">
+      <div className="flex min-w-0 items-center gap-2">
+        {threadTitleLoadable.state === "loading" ? (
+          <Skeleton className="h-5 w-48 rounded" />
+        ) : (
+          <>
+            <ChatThreadEmojiMenuButton
+              threadId={thread.threadId}
+              title={threadTitle}
+              emoji={threadTitleEmoji}
+            />
+            {threadTitleText && (
+              <span
+                className="min-w-0 truncate text-sm font-medium text-foreground"
+                data-testid="chat-thread-header-title"
+                onDoubleClick={openRenameDialog}
+              >
+                {threadTitleText}
+              </span>
+            )}
+          </>
+        )}
+      </div>
+      <div className="hidden sm:flex items-center gap-0.5">
+        <AutomationMenuButton threadId={thread.threadId} />
+        <ArtifactsButton thread={thread} />
+      </div>
+    </header>
+  );
+}
+
+function useChatThreadEmojiMenuActions({
+  threadId,
+  title,
+}: {
+  threadId: string;
+  title: string | null | undefined;
+}) {
+  const emojiMenuThreadId = useGet(emojiMenuThreadId$);
+  const emojiMenuTitle = useGet(emojiMenuTitle$);
+  const openChatThreadEmojiMenu = useSet(openChatThreadEmojiMenu$);
+  const closeChatThreadEmojiMenu = useSet(closeChatThreadEmojiMenu$);
+  const renameChatThread = useSet(renameChatThread$);
+  const focusChatThreadContainer = useSet(focusChatThreadContainer$);
+  const pageSignal = useGet(pageSignal$);
+  const open = emojiMenuThreadId === threadId;
+
+  function closeMenu() {
+    const openThreadId = emojiMenuThreadId;
+    closeChatThreadEmojiMenu();
+    if (openThreadId) {
+      queueMicrotask(() => {
+        focusChatThreadContainer(openThreadId);
+      });
+    }
+  }
+
+  function selectEmoji(nextEmoji: string) {
+    const activeThreadId = emojiMenuThreadId;
+    if (!activeThreadId) {
+      return;
+    }
+    detach(
+      (async () => {
+        await renameChatThread(
+          {
+            threadId: activeThreadId,
+            title: applyChatThreadEmoji(emojiMenuTitle ?? title, nextEmoji),
+          },
+          pageSignal,
+        );
+        closeMenu();
+      })(),
+      Reason.DomCallback,
+    );
+  }
+
+  function clearEmoji() {
+    const activeThreadId = emojiMenuThreadId;
+    if (!activeThreadId) {
+      return;
+    }
+    const nextTitle = removeChatThreadEmoji(emojiMenuTitle ?? title);
+    if (!nextTitle) {
+      closeMenu();
+      return;
+    }
+    detach(
+      (async () => {
+        await renameChatThread(
+          { threadId: activeThreadId, title: nextTitle },
+          pageSignal,
+        );
+        closeMenu();
+      })(),
+      Reason.DomCallback,
+    );
+  }
+
+  return { open, openChatThreadEmojiMenu, closeMenu, selectEmoji, clearEmoji };
+}
+
+function ChatThreadEmojiMenuButton({
+  emoji,
+  threadId,
+  title,
+}: {
+  emoji: string | null | undefined;
+  threadId: string;
+  title: string | null | undefined;
+}) {
+  const { open, openChatThreadEmojiMenu, closeMenu, selectEmoji, clearEmoji } =
+    useChatThreadEmojiMenuActions({ threadId, title });
+  const setEmojiQuery = useSet(setChatThreadEmojiQuery$);
+
+  return (
+    <TooltipProvider delayDuration={200}>
+      <Popover
+        open={open}
+        onOpenChange={(nextOpen) => {
+          if (nextOpen) {
+            setEmojiQuery("");
+            openChatThreadEmojiMenu({ threadId, title });
+          } else {
+            closeMenu();
+          }
+        }}
+      >
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                aria-label="Change icon"
+                className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              >
+                {emoji ? (
+                  <span
+                    aria-hidden="true"
+                    className="zero-emoji text-base leading-none"
+                  >
+                    {emoji}
+                  </span>
+                ) : (
+                  <IconMoodPlus size={18} stroke={1.75} aria-hidden="true" />
+                )}
+              </button>
+            </PopoverTrigger>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Chat thread icon</TooltipContent>
+        </Tooltip>
+        <PopoverContent
+          align="start"
+          className="w-80 p-0"
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+          }}
+        >
+          <ChatThreadEmojiPicker
+            hasEmoji={Boolean(emoji)}
+            onSelect={selectEmoji}
+            onRemove={clearEmoji}
+          />
+        </PopoverContent>
+      </Popover>
+    </TooltipProvider>
+  );
+}
+
+const FREQUENTLY_USED_EMOJI: ChatThreadEmojiItem[] =
+  CHAT_THREAD_EMOJI_OPTIONS.map((option) => {
+    return { emoji: option.emoji, name: option.label };
+  });
+
+function ChatThreadEmojiPicker({
+  hasEmoji,
+  onSelect,
+  onRemove,
+}: {
+  hasEmoji: boolean;
+  onSelect: (emoji: string) => void;
+  onRemove: () => void;
+}) {
+  const query = useGet(chatThreadEmojiQuery$);
+  const setQuery = useSet(setChatThreadEmojiQuery$);
+  const groups = useLastResolved(chatThreadEmojiGroups$) ?? null;
+
+  const isSearching = query.trim().length > 0;
+  const searchResults =
+    isSearching && groups ? filterChatThreadEmojiGroups(groups, query) : [];
+
+  return (
+    <div className="flex flex-col">
+      <div className="flex items-center gap-2 p-2">
+        <div className="relative flex-1">
+          <IconSearch
+            size={15}
+            className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground"
+            aria-hidden="true"
+          />
+          <Input
+            aria-label="Search emoji"
+            placeholder="Search emoji"
+            value={query}
+            autoFocus
+            onChange={(event) => {
+              setQuery(event.target.value);
+            }}
+            className="h-8 pl-8"
+          />
+        </div>
+        {hasEmoji && (
+          <button
+            type="button"
+            className="shrink-0 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            onClick={onRemove}
+          >
+            Remove
+          </button>
+        )}
+      </div>
+      <div className="max-h-72 overflow-y-auto px-2 pb-2">
+        {isSearching ? (
+          searchResults.length > 0 ? (
+            <ChatThreadEmojiGrid items={searchResults} onSelect={onSelect} />
+          ) : (
+            <p className="px-1 py-6 text-center text-xs text-muted-foreground">
+              No emoji found
+            </p>
+          )
+        ) : (
+          <>
+            <ChatThreadEmojiSection
+              label="Frequently used"
+              items={FREQUENTLY_USED_EMOJI}
+              onSelect={onSelect}
+              showShortcutDigits
+            />
+            {groups?.map((group) => {
+              return (
+                <ChatThreadEmojiSection
+                  key={group.name}
+                  label={group.name}
+                  items={group.emojis}
+                  onSelect={onSelect}
+                />
+              );
+            })}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ChatThreadEmojiSection({
+  label,
+  items,
+  onSelect,
+  showShortcutDigits = false,
+}: {
+  label: string;
+  items: ChatThreadEmojiItem[];
+  onSelect: (emoji: string) => void;
+  showShortcutDigits?: boolean;
+}) {
+  // Ctrl+Shift is a shared prefix for every digit shortcut, so surface it once
+  // as a quiet hint next to the label rather than repeating it on each emoji.
+  // getShortcutParts keeps the modifiers OS-aware (⌃⇧ on Mac, Ctrl+Shift else).
+  const shortcutHint = showShortcutDigits
+    ? `${formatModifierPrefix(getShortcutParts("ctrl+shift"))} + number`
+    : null;
+  return (
+    <div>
+      <div className="flex items-baseline justify-between gap-2 px-1 pb-1 pt-2">
+        <span className="text-xs font-medium text-muted-foreground">
+          {label}
+        </span>
+        {shortcutHint && (
+          <span className="text-[11px] text-muted-foreground/70">
+            {shortcutHint}
+          </span>
+        )}
+      </div>
+      <ChatThreadEmojiGrid
+        items={items}
+        onSelect={onSelect}
+        showShortcutDigits={showShortcutDigits}
+      />
+    </div>
+  );
+}
+
+// Join modifier keycap labels the way each platform reads them: Mac symbols
+// run together (⌃⇧), word labels are joined with "+" (Ctrl+Shift).
+function formatModifierPrefix(modifiers: string[]): string {
+  const usesWords = /[A-Za-z]/.test(modifiers[0] ?? "");
+  return modifiers.join(usesWords ? "+" : "");
+}
+
+function ChatThreadEmojiGrid({
+  items,
+  onSelect,
+  showShortcutDigits = false,
+}: {
+  items: ChatThreadEmojiItem[];
+  onSelect: (emoji: string) => void;
+  showShortcutDigits?: boolean;
+}) {
+  // Nine columns so the nine frequently-used digit shortcuts sit on a single
+  // row; every other emoji group uses the same width to stay aligned.
+  return (
+    <div className="grid grid-cols-9 gap-0.5">
+      {items.map((item, index) => {
+        // Ctrl+Shift+1-9 set the first nine "frequently used" icons. Keep a
+        // faint digit in the corner and reveal the full combo on hover so the
+        // shortcut is discoverable without cluttering the grid.
+        const shortcutDigit =
+          showShortcutDigits && index < 9 ? index + 1 : null;
+        const shortcutLabel =
+          shortcutDigit !== null
+            ? getShortcutLabel(`ctrl+shift+${shortcutDigit}`)
+            : undefined;
+        return (
+          <button
+            key={`${item.name}-${item.emoji}`}
+            type="button"
+            aria-label={item.name}
+            title={shortcutLabel}
+            className="relative flex aspect-square items-center justify-center rounded-md text-xl leading-none transition-colors hover:bg-accent"
+            onClick={() => {
+              onSelect(item.emoji);
+            }}
+          >
+            <span aria-hidden="true" className="zero-emoji">
+              {item.emoji}
+            </span>
+            {shortcutDigit !== null && (
+              <span
+                aria-hidden="true"
+                className="pointer-events-none absolute bottom-0 right-0.5 text-[9px] leading-none text-muted-foreground/60"
+              >
+                {shortcutDigit}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  const units = ["KB", "MB", "GB"] as const;
+  let value = bytes / 1024;
+  for (let i = 0; i < units.length; i++) {
+    const unit = units[i]!;
+    if (value < 1024 || i === units.length - 1) {
+      return `${value.toFixed(value >= 10 ? 0 : 1)} ${unit}`;
+    }
+    value = value / 1024;
+  }
+  return `${bytes} B`;
+}
+
+function formatArtifactTime(value: string): string {
+  return new Date(value).toLocaleString("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+type ChatArtifactItem = {
+  runId: string;
+  file: ChatThreadArtifactFile;
+};
+
+type ArtifactPreviewKind = "image" | "video" | "audio" | "document" | "file";
+
+const ARTIFACT_INBOX_SECTIONS = [
+  { key: "all", label: "All" },
+  { key: "media", label: "Media" },
+  { key: "docs", label: "Docs" },
+  { key: "sites", label: "Sites" },
+] as const satisfies readonly {
+  key: ArtifactInboxSection;
+  label: string;
+}[];
+
+type ArtifactInboxSectionEntry = (typeof ARTIFACT_INBOX_SECTIONS)[number];
+
+function artifactItemKey(item: ChatArtifactItem): string {
+  return `${item.runId}:${item.file.id}:${item.file.url}`;
+}
+
+function getArtifactPreviewKind(
+  file: ChatThreadArtifactFile,
+): ArtifactPreviewKind {
+  const kind = classifyChatAttachment({
+    filename: file.filename,
+    url: file.url,
+    contentType: file.contentType,
+  });
+
+  if (kind === "image") {
+    return "image";
+  }
+  if (kind === "video") {
+    return "video";
+  }
+  if (kind === "audio") {
+    return "audio";
+  }
+  if (
+    kind === "markdown" ||
+    kind === "text" ||
+    kind === "json" ||
+    kind === "csv" ||
+    kind === "pdf" ||
+    kind === "html"
+  ) {
+    return "document";
+  }
+  return "file";
+}
+
+function flattenArtifactRuns(
+  runs: { runId: string; files: ChatThreadArtifactFile[] }[],
+): ChatArtifactItem[] {
+  return runs.flatMap((run) => {
+    return run.files.map((file) => {
+      return { runId: run.runId, file };
+    });
+  });
+}
+
+function artifactFileKindLabel(file: ChatThreadArtifactFile): string {
+  if (file.artifactKind === "presentation-html") {
+    return "Presentation";
+  }
+  const documentKind = getArtifactDocumentPreviewKind(file);
+  if (documentKind === "html") {
+    return "Hosted site";
+  }
+  if (documentKind === "pdf") {
+    return "PDF";
+  }
+  if (documentKind === "markdown") {
+    return "Markdown";
+  }
+  if (documentKind === "json") {
+    return "JSON";
+  }
+  if (documentKind === "csv") {
+    return "Data";
+  }
+  if (documentKind === "text") {
+    return "Text";
+  }
+
+  const previewKind = getArtifactPreviewKind(file);
+  switch (previewKind) {
+    case "image": {
+      return "Image";
+    }
+    case "video": {
+      return "Video";
+    }
+    case "audio": {
+      return "Audio";
+    }
+    case "document": {
+      return "Document";
+    }
+    case "file": {
+      return "File";
+    }
+  }
+}
+
+function artifactMatchesInboxSection(
+  item: ChatArtifactItem,
+  section: ArtifactInboxSection,
+): boolean {
+  if (section === "all") {
+    return true;
+  }
+
+  const documentKind = getArtifactDocumentPreviewKind(item.file);
+  if (section === "sites") {
+    return documentKind === "html";
+  }
+  if (section === "docs") {
+    return documentKind !== null && documentKind !== "html";
+  }
+
+  const previewKind = getArtifactPreviewKind(item.file);
+  return (
+    previewKind === "image" ||
+    previewKind === "video" ||
+    previewKind === "audio"
+  );
+}
+
+function artifactInboxSectionsForItems(
+  items: readonly ChatArtifactItem[],
+): readonly ArtifactInboxSectionEntry[] {
+  return ARTIFACT_INBOX_SECTIONS.filter((entry) => {
+    return (
+      entry.key === "all" ||
+      items.some((item) => {
+        return artifactMatchesInboxSection(item, entry.key);
+      })
+    );
+  });
+}
+
+function resolveVisibleArtifactInboxSection(
+  section: ArtifactInboxSection,
+  sections: readonly ArtifactInboxSectionEntry[],
+): ArtifactInboxSection {
+  return sections.some((entry) => {
+    return entry.key === section;
+  })
+    ? section
+    : "all";
+}
+
+function artifactMatchesSearch(item: ChatArtifactItem, query: string): boolean {
+  if (query.length === 0) {
+    return true;
+  }
+  const haystack =
+    `${item.file.filename} ${item.file.contentType}`.toLowerCase();
+  return haystack.includes(query);
+}
+
+function ArtifactFileIcon({
+  file,
+  size = "sm",
+}: {
+  file: ChatThreadArtifactFile;
+  size?: "sm" | "md";
+}) {
+  return (
+    <FilePreviewIcon
+      filename={file.filename}
+      contentType={file.contentType}
+      size={size}
+      testId="artifact-file-icon"
+    />
+  );
+}
+
+function ArtifactPreviewBadge({ file }: { file: ChatThreadArtifactFile }) {
+  const previewKind = getArtifactPreviewKind(file);
+  const publicUrl = publicAttachmentUrl(file.url);
+
+  if (previewKind === "image") {
+    return (
+      <img
+        src={r2ImageTransformUrl(publicUrl, { width: 96, height: 96 })}
+        alt=""
+        aria-hidden="true"
+        className="h-full w-full object-cover"
+      />
+    );
+  }
+
+  if (previewKind === "video") {
+    return (
+      <video
+        src={videoPosterFrameUrl(publicUrl)}
+        preload="metadata"
+        muted
+        playsInline
+        aria-hidden="true"
+        className="h-full w-full object-cover"
+        data-testid="artifact-video-preview-badge"
+      />
+    );
+  }
+
+  if (getArtifactDocumentPreviewKind(file) === "html") {
+    return (
+      <span
+        className="relative block h-full w-full overflow-hidden bg-background"
+        aria-hidden="true"
+        data-testid="artifact-html-preview-badge"
+      >
+        <iframe
+          src={publicUrl}
+          title={`${file.filename} artifact thumbnail`}
+          sandbox="allow-same-origin allow-scripts"
+          tabIndex={-1}
+          loading="lazy"
+          scrolling="no"
+          className="pointer-events-none absolute left-0 top-0 h-[400%] w-[400%] origin-top-left scale-[0.25] border-0 bg-background"
+        />
+      </span>
+    );
+  }
+
+  return <ArtifactFileIcon file={file} />;
+}
+
+type ArtifactTextPreviewKind = "markdown" | "text" | "json" | "csv";
+type ArtifactDocumentPreviewKind = ArtifactTextPreviewKind | "pdf" | "html";
+
+function getArtifactTextPreviewKind(
+  file: ChatThreadArtifactFile,
+): ArtifactTextPreviewKind | null {
+  const kind = classifyChatAttachment({
+    filename: file.filename,
+    url: file.url,
+    contentType: file.contentType,
+  });
+
+  if (
+    kind === "markdown" ||
+    kind === "text" ||
+    kind === "json" ||
+    kind === "csv"
+  ) {
+    return kind;
+  }
+
+  if (/\.log$/i.test(file.filename)) {
+    return "text";
+  }
+
+  return null;
+}
+
+function getArtifactDocumentPreviewKind(
+  file: ChatThreadArtifactFile,
+): ArtifactDocumentPreviewKind | null {
+  const textKind = getArtifactTextPreviewKind(file);
+  if (textKind) {
+    return textKind;
+  }
+
+  const contentType = file.contentType.toLowerCase();
+  const filename = file.filename.toLowerCase();
+  if (contentType === "application/pdf" || filename.endsWith(".pdf")) {
+    return "pdf";
+  }
+  if (
+    contentType === "text/html" ||
+    filename.endsWith(".html") ||
+    filename.endsWith(".htm")
+  ) {
+    return "html";
+  }
+
+  return null;
+}
+
+type ChatImagePreviewLinkProps = {
+  alt: string;
+  ariaLabel: string;
+  imageClassName: string;
+  linkClassName: string;
+  onPreview: () => void;
+  placeholderClassName: string;
+  url: string;
+};
+
+const CHAT_INLINE_MEDIA_PREVIEW_CHROME_CLASS = cn(
+  "border border-foreground/10 shadow-sm transition-all duration-200",
+  "hover:scale-[1.015] hover:border-foreground/20 hover:shadow-lg hover:shadow-black/10 dark:hover:shadow-black/30",
+);
+const CHAT_INLINE_MEDIA_THUMBNAIL_PREVIEW_CLASS = cn(
+  "aspect-[10/9] w-[50px] max-w-full cursor-pointer rounded-lg",
+  CHAT_INLINE_MEDIA_PREVIEW_CHROME_CLASS,
+);
+const CHAT_INLINE_IMAGE_PREVIEW_CLASS = cn(
+  CHAT_INLINE_MEDIA_THUMBNAIL_PREVIEW_CLASS,
+  "bg-muted/30",
+);
+const CHAT_INLINE_VIDEO_ATTACHMENT_PREVIEW_CLASS = cn(
+  CHAT_INLINE_MEDIA_THUMBNAIL_PREVIEW_CLASS,
+  "bg-black",
+);
+const CHAT_INLINE_VIDEO_BODY_PREVIEW_CLASS = cn(
+  "aspect-[16/10] w-[min(100%,400px)] max-w-full cursor-pointer rounded-lg",
+  CHAT_INLINE_MEDIA_PREVIEW_CHROME_CLASS,
+  "bg-black",
+);
+
+const ARTIFACT_FULLSCREEN_SHELL_CLASSNAME =
+  "fixed inset-0 z-[100] flex min-h-0 flex-col bg-background pt-[var(--sat)] pb-[var(--sab)]";
+
+function ChatImagePreviewLink({
+  alt,
+  ariaLabel,
+  imageClassName,
+  linkClassName,
+  onPreview,
+  placeholderClassName,
+  url,
+}: ChatImagePreviewLinkProps) {
+  const imageLoadStatuses = useGet(imageLoadStatusByKey$);
+  const imageLoadStatusRef = useSet(imageLoadStatusRef$);
+  const setImageLoadStatus = useSet(setImageLoadStatus$);
+  const imageUrl = publicAttachmentUrl(url);
+  const previewImageUrl = r2ImageTransformUrl(imageUrl, {
+    width: 800,
+    height: 720,
+  });
+  const imageLoadKey = `chat-image-preview:${previewImageUrl}`;
+  const imageStatus = imageLoadStatuses[imageLoadKey] ?? "loading";
+
+  const showPlaceholder = imageStatus !== "loaded";
+
+  const openPreview = (event: ReactMouseEvent<HTMLAnchorElement>) => {
+    if (
+      event.metaKey ||
+      event.ctrlKey ||
+      event.shiftKey ||
+      event.altKey ||
+      event.button !== 0
+    ) {
+      return;
+    }
+    event.preventDefault();
+    onPreview();
+  };
+
+  return (
+    <a
+      href={imageUrl}
+      onClick={openPreview}
+      className={cn(
+        "group/image-preview relative inline-flex self-start items-center justify-center overflow-hidden",
+        linkClassName,
+      )}
+      aria-label={ariaLabel}
+    >
+      {showPlaceholder && (
+        <span
+          data-testid="chat-image-preview-loading"
+          className={cn(
+            "flex items-center justify-center bg-muted/70 text-muted-foreground",
+            placeholderClassName,
+          )}
+        >
+          {imageStatus === "loading" ? (
+            <IconLoader2 size={18} stroke={1.8} className="animate-spin" />
+          ) : (
+            <IconPhoto size={18} stroke={1.5} />
+          )}
+        </span>
+      )}
+      <img
+        key={imageLoadKey}
+        ref={imageLoadStatusRef}
+        src={previewImageUrl}
+        alt={alt}
+        data-image-load-key={imageLoadKey}
+        loading="lazy"
+        onLoad={() => {
+          setImageLoadStatus(imageLoadKey, "loaded");
+        }}
+        onError={() => {
+          setImageLoadStatus(imageLoadKey, "error");
+        }}
+        className={cn(
+          imageClassName,
+          showPlaceholder && "absolute inset-0 opacity-0",
+        )}
+      />
+    </a>
+  );
+}
+
+type ChatVideoPreviewButtonProps = {
+  ariaLabel: string;
+  buttonClassName: string;
+  filename: string;
+  onPreview: () => void;
+  posterClassName: string;
+  url: string;
+  videoClassName: string;
+};
+
+function videoPosterFrameUrl(url: string): string {
+  const hashIndex = url.indexOf("#");
+  const urlWithoutHash = hashIndex === -1 ? url : url.slice(0, hashIndex);
+  return `${urlWithoutHash}#t=0.001`;
+}
+
+function ChatVideoPreviewButton({
+  ariaLabel,
+  buttonClassName,
+  filename,
+  onPreview,
+  posterClassName,
+  url,
+  videoClassName,
+}: ChatVideoPreviewButtonProps) {
+  const videoUrl = publicAttachmentUrl(url);
+  const posterVideoUrl = videoPosterFrameUrl(videoUrl);
+
+  return (
+    <button
+      type="button"
+      onClick={onPreview}
+      title={filename}
+      aria-label={ariaLabel}
+      className={cn(
+        "group/video-preview relative inline-flex items-center justify-center overflow-hidden",
+        buttonClassName,
+      )}
+    >
+      <span
+        data-testid="chat-video-preview-poster"
+        className={cn("block bg-black", posterClassName)}
+      />
+      <video
+        src={posterVideoUrl}
+        preload="metadata"
+        muted
+        playsInline
+        aria-hidden="true"
+        className={cn("absolute inset-0", videoClassName)}
+      />
+      <span className="absolute inset-0 flex items-center justify-center bg-black/10 transition-colors group-hover/video-preview:bg-black/35">
+        <span className="flex h-9 w-9 items-center justify-center rounded-full bg-black/55 text-white shadow-lg transition-transform group-hover/video-preview:scale-105">
+          <IconPlayerPlay size={17} stroke={1.8} />
+        </span>
+      </span>
+    </button>
+  );
+}
+
+function ChatArtifactInboxHeader({
+  count,
+  fullscreen,
+  searchOpen,
+  onClose,
+  onToggleSearch,
+  onToggleFullscreen,
+}: {
+  count: number | null;
+  fullscreen: boolean;
+  searchOpen: boolean;
+  onClose: () => void;
+  onToggleSearch: () => void;
+  onToggleFullscreen: () => void;
+}) {
+  return (
+    <div className="flex min-h-14 shrink-0 items-center gap-3 border-b border-border/60 px-4 py-2">
+      <div className="flex min-w-0 flex-1 items-center gap-2">
+        <h2 className="truncate text-sm font-medium text-foreground">
+          Artifacts
+        </h2>
+        {count !== null && (
+          <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">
+            {count}
+          </span>
+        )}
+      </div>
+      <TooltipProvider delayDuration={300}>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={onToggleSearch}
+              aria-label="Search artifacts"
+              aria-pressed={searchOpen}
+              className={cn(
+                "inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground",
+                searchOpen && "bg-muted/60 text-foreground",
+              )}
+            >
+              <IconSearch size={16} />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Search artifacts</TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={onToggleFullscreen}
+              aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+              data-testid="artifact-inbox-fullscreen-toggle"
+              className="hidden h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground xl:inline-flex"
+            >
+              {fullscreen ? (
+                <IconArrowsDiagonalMinimize2 size={16} />
+              ) : (
+                <IconArrowsDiagonal size={16} />
+              )}
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">
+            {fullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+          </TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close artifacts"
+              className="inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+            >
+              <IconX size={16} />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Close artifacts</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    </div>
+  );
+}
+
+function ArtifactInboxTabs({
+  section,
+  sections,
+  setSection,
+}: {
+  section: ArtifactInboxSection;
+  sections: readonly ArtifactInboxSectionEntry[];
+  setSection: (value: ArtifactInboxSection) => void;
+}) {
+  return (
+    <div
+      className="grid rounded-lg bg-muted/70 p-1"
+      style={{
+        gridTemplateColumns: `repeat(${sections.length}, minmax(0, 1fr))`,
+      }}
+      role="tablist"
+      aria-label="Artifact sections"
+    >
+      {sections.map((entry) => {
+        const selected = section === entry.key;
+        return (
+          <button
+            key={entry.key}
+            type="button"
+            role="tab"
+            aria-selected={selected}
+            onClick={() => {
+              setSection(entry.key);
+            }}
+            className={cn(
+              "h-8 rounded-md px-2 text-xs font-medium transition-colors",
+              selected
+                ? "bg-background text-foreground shadow-sm"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {entry.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function ArtifactInboxSearch({
+  query,
+  setQuery,
+}: {
+  query: string;
+  setQuery: (value: string) => void;
+}) {
+  return (
+    <label className="relative block">
+      <span className="sr-only">Search artifacts</span>
+      <IconSearch
+        size={15}
+        className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground"
+      />
+      <input
+        value={query}
+        onChange={(event) => {
+          setQuery(event.currentTarget.value);
+        }}
+        className="h-9 w-full rounded-lg border border-border/70 bg-background pl-9 pr-3 text-sm text-foreground outline-none transition-colors placeholder:text-muted-foreground focus:border-ring"
+        placeholder="Search"
+        autoComplete="off"
+        autoFocus
+      />
+    </label>
+  );
+}
+
+function ArtifactInboxRow({
+  item,
+  onOpen,
+}: {
+  item: ChatArtifactItem;
+  onOpen: () => void;
+}) {
+  const { file } = item;
+
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      aria-label={`Open artifact ${file.filename}`}
+      className="group flex w-full min-w-0 items-center gap-3 rounded-lg border border-border/60 bg-background/80 p-3 text-left shadow-sm transition-colors hover:border-foreground/20 hover:bg-muted/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+    >
+      <span className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-muted text-muted-foreground">
+        <ArtifactPreviewBadge file={file} />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span
+          className="block truncate text-sm font-medium text-foreground"
+          title={file.filename}
+        >
+          {file.filename}
+        </span>
+        <span className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+          <span>{artifactFileKindLabel(file)}</span>
+          <span aria-hidden>·</span>
+          <span>{formatBytes(file.size)}</span>
+          <span aria-hidden>·</span>
+          <span>{formatArtifactTime(file.createdAt)}</span>
+        </span>
+      </span>
+      <IconChevronRight
+        size={16}
+        className="shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-foreground"
+      />
+    </button>
+  );
+}
+
+function ChatArtifactInboxBody({ thread }: { thread: ChatThreadSignals }) {
+  const loadable = useLastLoadable(thread.artifacts$);
+  const section = useGet(artifactInboxSection$);
+  const query = useGet(artifactInboxQuery$);
+  const searchOpen = useGet(artifactInboxSearchOpen$);
+  const setSection = useSet(setArtifactInboxSection$);
+  const setQuery = useSet(setArtifactInboxQuery$);
+  const openArtifact = useSet(openArtifactFromInbox$);
+
+  if (loadable.state === "loading") {
+    return (
+      <div className="flex flex-col gap-3">
+        {Array.from({ length: 5 }, (_, i) => {
+          return <Skeleton key={i} className="h-[74px] rounded-lg" />;
+        })}
+      </div>
+    );
+  }
+
+  if (loadable.state === "hasError") {
+    return (
+      <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-4 text-sm text-destructive">
+        Failed to load artifacts
+      </div>
+    );
+  }
+
+  if (loadable.state !== "hasData") {
+    return null;
+  }
+
+  const items = flattenArtifactRuns(loadable.data);
+  if (items.length === 0) {
+    return (
+      <div className="flex h-full min-h-[360px] flex-col items-center justify-center gap-3 rounded-lg border border-dashed border-border/70 p-8 text-center">
+        <img
+          src={emptyArtifactImg}
+          alt=""
+          role="presentation"
+          loading="lazy"
+          className="h-24 w-24 object-contain opacity-80"
+        />
+        <p className="text-sm text-muted-foreground">
+          No uploaded files in this chat yet.
+        </p>
+      </div>
+    );
+  }
+
+  const normalizedQuery = query.trim().toLowerCase();
+  const sections = artifactInboxSectionsForItems(items);
+  const activeSection = resolveVisibleArtifactInboxSection(section, sections);
+  const visibleItems = items.filter((item) => {
+    return (
+      artifactMatchesInboxSection(item, activeSection) &&
+      artifactMatchesSearch(item, normalizedQuery)
+    );
+  });
+
+  return (
+    <div className="flex min-h-full flex-col gap-4">
+      <ArtifactInboxTabs
+        section={activeSection}
+        sections={sections}
+        setSection={setSection}
+      />
+      {(searchOpen || query.length > 0) && (
+        <ArtifactInboxSearch query={query} setQuery={setQuery} />
+      )}
+      {visibleItems.length === 0 ? (
+        <div className="flex flex-1 items-center justify-center rounded-lg border border-dashed border-border/70 p-8 text-center text-sm text-muted-foreground">
+          No artifacts match this view.
+        </div>
+      ) : (
+        <div className="flex flex-col gap-2">
+          {visibleItems.map((item) => {
+            return (
+              <ArtifactInboxRow
+                key={artifactItemKey(item)}
+                item={item}
+                onOpen={() => {
+                  openArtifact({
+                    threadId: thread.threadId,
+                    url: item.file.url,
+                  });
+                }}
+              />
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ChatArtifactInboxList({ thread }: { thread: ChatThreadSignals }) {
+  const loadable = useLastLoadable(thread.artifacts$);
+  const fullscreen = useGet(artifactFullscreen$);
+  const searchOpen = useGet(artifactInboxSearchOpen$);
+  const toggleFullscreen = useSet(toggleArtifactFullscreen$);
+  const toggleSearch = useSet(toggleArtifactInboxSearch$);
+  const close = useSet(closeArtifact$);
+  const count =
+    loadable.state === "hasData"
+      ? flattenArtifactRuns(loadable.data).length
+      : null;
+
+  const inbox = (
+    <div
+      className={cn(
+        fullscreen
+          ? ARTIFACT_FULLSCREEN_SHELL_CLASSNAME
+          : "flex h-full w-full min-h-0 flex-col border-l border-border/60 bg-background xl:border-l-0",
+        "animate-in fade-in duration-[180ms] ease",
+      )}
+      data-testid="artifact-inbox"
+    >
+      <ChatArtifactInboxHeader
+        count={count}
+        fullscreen={fullscreen}
+        searchOpen={searchOpen}
+        onToggleSearch={toggleSearch}
+        onToggleFullscreen={toggleFullscreen}
+        onClose={close}
+      />
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+        <ChatArtifactInboxBody thread={thread} />
+      </div>
+    </div>
+  );
+  return fullscreen && typeof document !== "undefined"
+    ? createPortal(inbox, document.body)
+    : inbox;
+}
+
+function ChatArtifactInboxSlot({
+  artifactRef,
+  leftThread,
+  rightThread,
+}: {
+  artifactRef: ArtifactRef | null;
+  leftThread: ChatThreadSignals | null;
+  rightThread: ChatThreadSignals | null;
+}) {
+  const inboxThreadId = useGet(currentArtifactInboxThreadId$);
+  const backToInbox = useSet(backToArtifactInbox$);
+  const close = useSet(closeArtifact$);
+  const thread =
+    [leftThread, rightThread].find((candidate) => {
+      return candidate?.threadId === inboxThreadId;
+    }) ??
+    leftThread ??
+    rightThread;
+
+  if (artifactRef) {
+    return (
+      <ArtifactSidebar
+        artifactRef={artifactRef}
+        thread={thread ?? undefined}
+        onBack={inboxThreadId ? backToInbox : undefined}
+        onClose={close}
+      />
+    );
+  }
+
+  if (!thread || !inboxThreadId) {
+    return null;
+  }
+
+  return <ChatArtifactInboxList thread={thread} />;
+}
+
+function formatHeaderWorkflowAutomationRun(value: string | null): string {
+  if (!value) {
+    return "No runs yet";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "No runs yet";
+  }
+  return date.toLocaleString("en-US", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+}
+
+function formatHeaderWorkflowAutomationNextRun(value: string | null): string {
+  if (!value) {
+    return "No upcoming run";
+  }
+  return formatHeaderWorkflowAutomationRun(value);
+}
+
+function formatHeaderClockTime(hour: number, minute: number): string {
+  const ampm = hour >= 12 ? "PM" : "AM";
+  const h12 = hour === 0 ? 12 : hour > 12 ? hour - 12 : hour;
+  return `${h12}:${String(minute).padStart(2, "0")} ${ampm}`;
+}
+
+function formatHeaderIntervalSeconds(seconds: number): string {
+  if (seconds % 3600 === 0) {
+    const hours = seconds / 3600;
+    return `Every ${hours} ${hours === 1 ? "hour" : "hours"}`;
+  }
+  if (seconds % 60 === 0) {
+    const minutes = seconds / 60;
+    return `Every ${minutes} ${minutes === 1 ? "minute" : "minutes"}`;
+  }
+  return `Every ${seconds} ${seconds === 1 ? "second" : "seconds"}`;
+}
+
+function headerCronRuleLabel(
+  cronExpression: string,
+  sourceTimezone: string,
+  displayTimezone: string,
+): string {
+  const [minutePart, hourPart, dayOfMonth = "*", , dayOfWeek = "*"] =
+    cronExpression.split(" ");
+  const minute = Number(minutePart);
+  const hour = Number(hourPart);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) {
+    return `${cronExpression} (${sourceTimezone})`;
+  }
+  const converted = cronWallTimeInTimezone(
+    hour,
+    minute,
+    sourceTimezone,
+    displayTimezone,
+  );
+  const time = formatHeaderClockTime(converted.hour, converted.minute);
+  if (dayOfMonth !== "*") {
+    return `Every month on day ${dayOfMonth} at ${time}`;
+  }
+  if (dayOfWeek === "1-5") {
+    return `Every weekday at ${time}`;
+  }
+  if (dayOfWeek !== "*") {
+    const dayNames: Readonly<Record<string, string>> = {
+      "0": "Sunday",
+      "1": "Monday",
+      "2": "Tuesday",
+      "3": "Wednesday",
+      "4": "Thursday",
+      "5": "Friday",
+      "6": "Saturday",
+    };
+    const days = dayOfWeek
+      .split(",")
+      .map((day) => {
+        return dayNames[day];
+      })
+      .filter(Boolean)
+      .join(", ");
+    return days ? `Every week on ${days} at ${time}` : `Every week at ${time}`;
+  }
+  return `Every day at ${time}`;
+}
+
+function headerWorkflowAutomationRule(
+  automation: HeaderWorkflowAutomationEntry,
+): string {
+  const source = automation.automation;
+  if (source.kind !== "schedule") {
+    return gmailAutomationTitle(source);
+  }
+  const schedule = source.schedule;
+  if (schedule.type === "loop") {
+    return formatHeaderIntervalSeconds(schedule.intervalSeconds);
+  }
+  if (schedule.type === "once") {
+    const { date, hour, minute } = atTimeInTimezone(
+      schedule.atTime,
+      automation.timezone,
+    );
+    return `Once on ${date} at ${formatHeaderClockTime(hour, minute)}`;
+  }
+  return headerCronRuleLabel(
+    schedule.cronExpression,
+    schedule.timezone,
+    automation.timezone,
+  );
+}
+
+function headerWorkflowAutomationRows(
+  automation: HeaderWorkflowAutomationEntry,
+): readonly WorkflowAutomationCardRow[] {
+  const rows: WorkflowAutomationCardRow[] = [
+    {
+      label:
+        automation.automation.kind === "schedule" ? "Schedule" : "Automation",
+      value: headerWorkflowAutomationRule(automation),
+    },
+    {
+      label: "Last run",
+      value: formatHeaderWorkflowAutomationRun(automation.automation.lastRunAt),
+    },
+  ];
+  if (automation.automation.kind === "schedule") {
+    rows.push({
+      label: "Next run",
+      value: formatHeaderWorkflowAutomationNextRun(
+        automation.automation.nextRunAt,
+      ),
+    });
+  }
+  const matchSummary = gmailAutomationSummary(automation.automation);
+  if (matchSummary) {
+    rows.splice(1, 0, { label: "Match", value: matchSummary });
+  }
+  return rows;
+}
+
+function HeaderWorkflowAutomationCard({
+  automation,
+}: {
+  automation: HeaderWorkflowAutomationEntry;
+}) {
+  const pageSignal = useGet(pageSignal$);
+  const editingAutomationId = useGet(currentEditingHeaderWorkflowAutomationId$);
+  const setEditingAutomationId = useSet(setEditingHeaderWorkflowAutomationId$);
+  const [runningLoadable, runNow] = useLoadableSet(
+    runHeaderWorkflowAutomationNow$,
+  );
+  const running = runningLoadable.state === "loading";
+  const title =
+    automation.workflowDisplayName?.trim() || automation.workflowName;
+  const rows = headerWorkflowAutomationRows(automation);
+  const editing = editingAutomationId === automation.id;
+
+  return (
+    <div className="min-w-0">
+      <div className="mb-2 flex min-w-0 items-center justify-between gap-3">
+        <p className="min-w-0 truncate text-sm font-normal leading-snug text-muted-foreground">
+          {title}
+        </p>
+        <Link
+          pathname={ROUTES.workflowDetailAutomations}
+          options={{
+            pathParams: {
+              workflowId: automation.workflowId,
+            },
+          }}
+          className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md px-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-gray-50 hover:text-foreground"
+        >
+          View
+          <IconArrowUpRight size={12} stroke={1.5} />
+        </Link>
+      </div>
+      <WorkflowAutomationCard
+        rows={rows}
+        dimmed={!automation.enabled}
+        actions={
+          <>
+            {automation.automation.kind === "schedule" ||
+            (automation.automation.kind === "event" &&
+              (automation.automation.eventType === "gmail-new-message" ||
+                automation.automation.eventType === "gmail-label-applied")) ? (
+              <button
+                type="button"
+                className="rounded-md px-1 py-1 text-sm font-medium text-muted-foreground underline-offset-4 transition-colors hover:text-foreground hover:underline"
+                onClick={() => {
+                  setEditingAutomationId(automation.id);
+                }}
+              >
+                Edit
+              </button>
+            ) : null}
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="zero-btn-morandi h-8 shrink-0 gap-1.5 rounded-lg px-3 text-xs font-medium"
+              disabled={running}
+              onClick={() => {
+                detach(
+                  runNow(automation.id, pageSignal),
+                  Reason.DomCallback,
+                  "run header workflow automation now",
+                );
+              }}
+            >
+              {running ? (
+                <IconLoader2 size={13} className="animate-spin" />
+              ) : (
+                <IconPlayerPlay size={13} stroke={1.5} />
+              )}
+              {running ? "Starting..." : "Run now"}
+            </Button>
+          </>
+        }
+      />
+      <HeaderWorkflowAutomationEditDialog
+        automation={automation.automation}
+        displayTimezone={automation.timezone}
+        open={editing}
+        onOpenChange={(open) => {
+          setEditingAutomationId(open ? automation.id : null);
+        }}
+      />
+    </div>
+  );
+}
+
+function HeaderWorkflowAutomationEditDialog({
+  automation,
+  displayTimezone,
+  open,
+  onOpenChange,
+}: {
+  readonly automation: ChatThreadWorkflowAutomation;
+  readonly displayTimezone: string;
+  readonly open: boolean;
+  readonly onOpenChange: (open: boolean) => void;
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        className={
+          automation.kind === "event" &&
+          automation.eventType === "gmail-new-message"
+            ? "max-w-2xl"
+            : ""
+        }
+      >
+        <DialogHeader>
+          <DialogTitle>Edit automation</DialogTitle>
+          <DialogDescription>
+            Update this workflow automation.
+          </DialogDescription>
+        </DialogHeader>
+        {automation.kind === "schedule" ? (
+          <HeaderScheduleAutomationEditForm
+            automation={automation}
+            displayTimezone={displayTimezone}
+            onDone={() => {
+              onOpenChange(false);
+            }}
+          />
+        ) : null}
+        {automation.kind === "event" &&
+        automation.eventType === "gmail-new-message" ? (
+          <HeaderGmailNewMessageAutomationEditForm
+            automation={automation}
+            onDone={() => {
+              onOpenChange(false);
+            }}
+          />
+        ) : null}
+        {automation.kind === "event" &&
+        automation.eventType === "gmail-label-applied" ? (
+          <HeaderGmailLabelAutomationEditForm
+            automation={automation}
+            onDone={() => {
+              onOpenChange(false);
+            }}
+          />
+        ) : null}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+const HEADER_AUTOMATION_FIELD_CLASS =
+  "h-9 w-full rounded-md border border-border/60 bg-background px-2.5 text-sm outline-none transition-colors focus:border-primary disabled:opacity-60";
+
+function localDateTimeInputValue(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hour = String(date.getHours()).padStart(2, "0");
+  const minute = String(date.getMinutes()).padStart(2, "0");
+  return `${year}-${month}-${day}T${hour}:${minute}`;
+}
+
+function scheduleFromHeaderAutomationForm(
+  automation: Extract<ChatThreadWorkflowAutomation, { kind: "schedule" }>,
+  form: FormData,
+): ZeroWorkflowSchedule | null {
+  const schedule = automation.schedule;
+  if (schedule.type === "loop") {
+    const intervalSeconds = Number(form.get("intervalSeconds"));
+    return Number.isInteger(intervalSeconds) && intervalSeconds > 0
+      ? { type: "loop", intervalSeconds }
+      : null;
+  }
+  if (schedule.type === "once") {
+    const rawAtTime = String(form.get("atTime") ?? "");
+    if (!rawAtTime) {
+      return null;
+    }
+    const atTime = new Date(rawAtTime);
+    return Number.isNaN(atTime.getTime())
+      ? null
+      : {
+          type: "once",
+          atTime: atTime.toISOString(),
+          timezone: schedule.timezone,
+        };
+  }
+  const cronExpression = String(form.get("cronExpression") ?? "").trim();
+  return cronExpression
+    ? {
+        type: "cron",
+        cronExpression,
+        timezone: schedule.timezone,
+      }
+    : null;
+}
+
+function HeaderScheduleAutomationEditForm({
+  automation,
+  displayTimezone,
+  onDone,
+}: {
+  readonly automation: Extract<
+    ChatThreadWorkflowAutomation,
+    { kind: "schedule" }
+  >;
+  readonly displayTimezone: string;
+  readonly onDone: () => void;
+}) {
+  const pageSignal = useGet(pageSignal$);
+  const [updateLoadable, updateAutomation] = useLoadableSet(
+    updateHeaderWorkflowScheduleAutomation$,
+  );
+  const saving = updateLoadable.state === "loading";
+  const schedule = automation.schedule;
+
+  return (
+    <form
+      className="flex flex-col gap-4"
+      onSubmit={(event: FormEvent<HTMLFormElement>) => {
+        event.preventDefault();
+        const scheduleValue = scheduleFromHeaderAutomationForm(
+          automation,
+          new FormData(event.currentTarget),
+        );
+        if (!scheduleValue) {
+          return;
+        }
+        detach(
+          (async () => {
+            await updateAutomation(
+              { automationId: automation.id, schedule: scheduleValue },
+              pageSignal,
+            );
+            onDone();
+          })(),
+          Reason.DomCallback,
+          "update header workflow schedule automation",
+        );
+      }}
+    >
+      {schedule.type === "loop" ? (
+        <HeaderIntervalField
+          disabled={saving}
+          defaultIntervalSeconds={schedule.intervalSeconds}
+        />
+      ) : null}
+      {schedule.type === "once" ? (
+        <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+          Run at
+          <input
+            name="atTime"
+            aria-label="Run at"
+            type="datetime-local"
+            defaultValue={localDateTimeInputValue(schedule.atTime)}
+            disabled={saving}
+            className={HEADER_AUTOMATION_FIELD_CLASS}
+          />
+          <span>Displays in {displayTimezone}</span>
+        </label>
+      ) : null}
+      {schedule.type === "cron" ? (
+        <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+          Cron expression
+          <input
+            name="cronExpression"
+            aria-label="Cron expression"
+            defaultValue={schedule.cronExpression}
+            disabled={saving}
+            className={HEADER_AUTOMATION_FIELD_CLASS}
+          />
+          <span>Runs in {schedule.timezone}</span>
+        </label>
+      ) : null}
+      <DialogFooter>
+        <Button
+          type="button"
+          variant="outline"
+          disabled={saving}
+          onClick={onDone}
+        >
+          Cancel
+        </Button>
+        <Button type="submit" disabled={saving}>
+          {saving ? <IconLoader2 size={14} className="animate-spin" /> : null}
+          Save automation
+        </Button>
+      </DialogFooter>
+    </form>
+  );
+}
+
+function HeaderIntervalField({
+  disabled,
+  defaultIntervalSeconds,
+}: {
+  readonly disabled: boolean;
+  readonly defaultIntervalSeconds: number;
+}) {
+  return (
+    <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+      Every
+      <Select
+        name="intervalSeconds"
+        defaultValue={String(defaultIntervalSeconds)}
+        disabled={disabled}
+      >
+        <SelectTrigger className="h-9 w-full" aria-label="Every">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {getWorkflowIntervalSecondOptions(defaultIntervalSeconds).map(
+            (seconds) => {
+              return (
+                <SelectItem key={seconds} value={String(seconds)}>
+                  {formatWorkflowIntervalSeconds(seconds)}
+                </SelectItem>
+              );
+            },
+          )}
+        </SelectContent>
+      </Select>
+    </label>
+  );
+}
+
+function HeaderGmailNewMessageAutomationEditForm({
+  automation,
+  onDone,
+}: {
+  readonly automation: Extract<
+    ChatThreadWorkflowAutomation,
+    { eventType: "gmail-new-message" }
+  >;
+  readonly onDone: () => void;
+}) {
+  const pageSignal = useGet(pageSignal$);
+  const [updateLoadable, updateAutomation] = useLoadableSet(
+    updateHeaderWorkflowGmailNewMessageAutomation$,
+  );
+  const saving = updateLoadable.state === "loading";
+
+  return (
+    <form
+      className="flex flex-col gap-4"
+      onSubmit={(event: FormEvent<HTMLFormElement>) => {
+        event.preventDefault();
+        const form = new FormData(event.currentTarget);
+        detach(
+          (async () => {
+            await updateAutomation(
+              {
+                automationId: automation.id,
+                eventConfig: buildGmailNewMessageEventConfig(
+                  form,
+                  automation.eventConfig,
+                ),
+              },
+              pageSignal,
+            );
+            onDone();
+          })(),
+          Reason.DomCallback,
+          "update header workflow Gmail automation",
+        );
+      }}
+    >
+      <div className="grid gap-3 sm:grid-cols-2">
+        {GMAIL_TEXT_FIELDS.map(({ field, label }) => {
+          return (
+            <div key={field} className="grid grid-cols-2 gap-2">
+              <input
+                name={`${field}Contains`}
+                aria-label={`${label} contains`}
+                defaultValue={gmailMatcherDefaultValue(
+                  automation.eventConfig,
+                  field,
+                  "contains",
+                )}
+                disabled={saving}
+                placeholder={`${label} contains`}
+                className={HEADER_AUTOMATION_FIELD_CLASS}
+              />
+              <input
+                name={`${field}DoesNotContain`}
+                aria-label={`${label} does not contain`}
+                defaultValue={gmailMatcherDefaultValue(
+                  automation.eventConfig,
+                  field,
+                  "doesNotContain",
+                )}
+                disabled={saving}
+                placeholder={`${label} does not contain`}
+                className={HEADER_AUTOMATION_FIELD_CLASS}
+              />
+            </div>
+          );
+        })}
+      </div>
+      <DialogFooter>
+        <Button
+          type="button"
+          variant="outline"
+          disabled={saving}
+          onClick={onDone}
+        >
+          Cancel
+        </Button>
+        <Button type="submit" disabled={saving}>
+          {saving ? <IconLoader2 size={14} className="animate-spin" /> : null}
+          Save automation
+        </Button>
+      </DialogFooter>
+    </form>
+  );
+}
+
+function HeaderGmailLabelAutomationEditForm({
+  automation,
+  onDone,
+}: {
+  readonly automation: Extract<
+    ChatThreadWorkflowAutomation,
+    { eventType: "gmail-label-applied" }
+  >;
+  readonly onDone: () => void;
+}) {
+  const pageSignal = useGet(pageSignal$);
+  const [updateLoadable, updateAutomation] = useLoadableSet(
+    updateHeaderWorkflowGmailLabelAppliedAutomation$,
+  );
+  const saving = updateLoadable.state === "loading";
+
+  return (
+    <form
+      className="flex flex-col gap-4"
+      onSubmit={(event: FormEvent<HTMLFormElement>) => {
+        event.preventDefault();
+        const eventConfig = buildGmailLabelAppliedEventConfig(
+          new FormData(event.currentTarget),
+        );
+        if (!eventConfig) {
+          return;
+        }
+        detach(
+          (async () => {
+            await updateAutomation(
+              { automationId: automation.id, eventConfig },
+              pageSignal,
+            );
+            onDone();
+          })(),
+          Reason.DomCallback,
+          "update header workflow Gmail label automation",
+        );
+      }}
+    >
+      <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+        Label name
+        <input
+          name="labelName"
+          aria-label="Label name"
+          required
+          defaultValue={automation.eventConfig.labelName}
+          disabled={saving}
+          placeholder="Support"
+          className={HEADER_AUTOMATION_FIELD_CLASS}
+        />
+      </label>
+      <DialogFooter>
+        <Button
+          type="button"
+          variant="outline"
+          disabled={saving}
+          onClick={onDone}
+        >
+          Cancel
+        </Button>
+        <Button type="submit" disabled={saving}>
+          {saving ? <IconLoader2 size={14} className="animate-spin" /> : null}
+          Save automation
+        </Button>
+      </DialogFooter>
+    </form>
+  );
+}
+function HeaderWorkflowQueueSection({ threadId }: { threadId: string }) {
+  const queue = useLastResolved(workflowQueueForThread(threadId));
+  const pageSignal = useGet(pageSignal$);
+  const skipEvent = useSet(skipWorkflowQueueEvent$);
+  const clearQueue = useSet(clearWorkflowQueue$);
+  const setPaused = useSet(setWorkflowQueuePaused$);
+
+  if (!queue) {
+    return null;
+  }
+  const paused = queue.pausedAt !== null;
+  if (!queue.running && queue.pending.length === 0 && !paused) {
+    return null;
+  }
+
+  return (
+    <section
+      className="rounded-lg border border-border/60 bg-muted/20 p-3"
+      aria-label="Workflow queue"
+      data-testid="workflow-queue-section"
+    >
+      <div className="flex items-center gap-2">
+        <div className="min-w-0 flex-1 text-xs font-medium text-foreground">
+          Queue
+          {queue.pending.length > 0 ? (
+            <span className="ml-1 text-muted-foreground">
+              {queue.pending.length} waiting
+            </span>
+          ) : null}
+        </div>
+        <button
+          type="button"
+          className="inline-flex h-6 items-center gap-1 rounded-md px-1.5 text-xs text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+          aria-label={paused ? "Resume queue" : "Pause queue"}
+          onClick={() => {
+            detach(
+              setPaused({ threadId, paused: !paused }, pageSignal),
+              Reason.DomCallback,
+            );
+          }}
+        >
+          {paused ? (
+            <IconPlayerPlay size={13} />
+          ) : (
+            <IconPlayerPause size={13} />
+          )}
+          {paused ? "Resume" : "Pause"}
+        </button>
+        {queue.pending.length > 0 ? (
+          <button
+            type="button"
+            className="inline-flex h-6 items-center rounded-md px-1.5 text-xs text-muted-foreground hover:bg-muted/60 hover:text-destructive"
+            onClick={() => {
+              detach(clearQueue(threadId, pageSignal), Reason.DomCallback);
+            }}
+          >
+            Clear queue ({queue.pending.length})
+          </button>
+        ) : null}
+      </div>
+
+      {paused ? (
+        <div className="mt-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-400">
+          Queue paused{queue.pauseReason ? `: ${queue.pauseReason}` : ""}. New
+          events keep queueing and run after you resume.
+        </div>
+      ) : null}
+
+      {queue.running ? (
+        <div className="mt-2 flex items-start gap-2 text-xs">
+          <span className="mt-1 h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-primary" />
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-foreground">
+              {queue.running.triggerBrief ?? "Running automation"}
+            </div>
+            <div className="text-muted-foreground">
+              {queue.running.status === "running" ? "Running" : "Starting"}
+              {" · "}
+              {formatHeaderWorkflowAutomationRun(queue.running.createdAt)}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {queue.pending.length > 0 ? (
+        <ul className="mt-2 grid gap-1">
+          {queue.pending.map((event, index) => {
+            return (
+              <li
+                key={event.id}
+                className="flex items-center gap-2 rounded-md px-1 py-0.5 text-xs hover:bg-muted/40"
+              >
+                <span className="w-4 shrink-0 text-right text-muted-foreground">
+                  {index + 1}
+                </span>
+                <span className="min-w-0 flex-1 truncate text-foreground">
+                  {event.triggerBrief ?? event.triggerSource}
+                </span>
+                <span className="shrink-0 text-muted-foreground">
+                  {formatHeaderWorkflowAutomationRun(event.createdAt)}
+                </span>
+                <button
+                  type="button"
+                  className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted/60 hover:text-destructive"
+                  aria-label="Skip queued event"
+                  onClick={() => {
+                    detach(skipEvent(event.id, pageSignal), Reason.DomCallback);
+                  }}
+                >
+                  <IconX size={12} />
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+    </section>
+  );
+}
+
+function HeaderAutomationSidebar({ threadId }: { threadId: string }) {
+  const workflowAutomations$ = headerWorkflowAutomationsForThread(threadId);
+  const workflowAutomationsLoadable = useLastLoadable(workflowAutomations$);
+  const lastResolvedAutomations = useLastResolved(workflowAutomations$);
+  const close = useSet(closeHeaderAutomationSidebar$);
+  const workflowAutomations =
+    workflowAutomationsLoadable.state === "hasData"
+      ? workflowAutomationsLoadable.data
+      : (lastResolvedAutomations ?? []);
+  const isEmpty = workflowAutomations.length === 0;
+  const loading = isEmpty && workflowAutomationsLoadable.state === "loading";
+
+  return (
+    <aside
+      aria-label="Automations"
+      className="flex h-full w-full min-h-0 flex-col border-l border-border/60 bg-background xl:border-l-0 animate-in fade-in slide-in-from-right-2 duration-[180ms] ease"
+      data-testid="automation-sidebar"
+    >
+      <div className="flex min-h-14 shrink-0 items-center gap-3 border-b border-border/60 px-4 py-2">
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm font-medium text-foreground">
+            Automations
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={close}
+          aria-label="Close automations"
+          className="inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+        >
+          <IconX size={16} />
+        </button>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+        {loading ? (
+          <div className="grid gap-3">
+            <Skeleton className="h-36 rounded-lg" />
+            <Skeleton className="h-36 rounded-lg" />
+          </div>
+        ) : isEmpty ? (
+          <div className="flex h-full items-center justify-center px-6 text-center text-sm text-muted-foreground">
+            No automations yet.
+          </div>
+        ) : (
+          <div className="grid gap-6">
+            <HeaderWorkflowQueueSection threadId={threadId} />
+            {workflowAutomations.length > 0 ? (
+              <div className="grid gap-3">
+                {workflowAutomations.map((automation) => {
+                  return (
+                    <HeaderWorkflowAutomationCard
+                      key={automation.id}
+                      automation={automation}
+                    />
+                  );
+                })}
+              </div>
+            ) : null}
+          </div>
+        )}
+      </div>
+    </aside>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ZeroSessionChatPage — real conversation backed by agent runs
+// ---------------------------------------------------------------------------
+
+function ChatThread({
+  thread,
+  onFocusFallbackRef,
+}: {
+  thread: ChatThreadSignals;
+  onFocusFallbackRef?: (el: HTMLElement | null) => (() => void) | undefined;
+}) {
+  const setContainerRef = useSet(thread.setContainerRef$);
+
+  return (
+    <section
+      aria-label="Chat thread"
+      className="flex min-w-0 basis-0 flex-1 flex-col min-h-0 bg-transparent focus:outline-none"
+      data-chat-thread-container-id={thread.threadId}
+      ref={(el) => {
+        const cleanupContainerRef = setContainerRef(el);
+        const cleanupFocusFallbackRef = onFocusFallbackRef?.(el);
+        return () => {
+          cleanupFocusFallbackRef?.();
+          cleanupContainerRef?.();
+        };
+      }}
+      tabIndex={-1}
+    >
+      <ChatThreadContent thread={thread} />
+    </section>
+  );
+}
+
+// Drag the divider to resize the artifact preview against the chat thread.
+// The preview panel is the right-most child, so its right edge coincides with
+// the container's right edge; the width is the gap from the pointer to it.
+function startArtifactPanelResize(
+  event: ReactPointerEvent<HTMLDivElement>,
+  setWidth: (width: number) => void,
+  setResizing: (resizing: boolean) => void,
+): void {
+  const container = event.currentTarget.parentElement;
+  if (!container) {
+    return;
+  }
+  event.preventDefault();
+  const rect = container.getBoundingClientRect();
+  const maxWidth = Math.max(
+    ARTIFACT_PANEL_MIN_WIDTH,
+    rect.width - ARTIFACT_PANEL_MIN_THREAD_WIDTH,
+  );
+  setResizing(true);
+  document.body.style.cursor = "col-resize";
+  document.body.style.userSelect = "none";
+
+  function onMove(moveEvent: PointerEvent): void {
+    const next = Math.min(
+      Math.max(rect.right - moveEvent.clientX, ARTIFACT_PANEL_MIN_WIDTH),
+      maxWidth,
+    );
+    setWidth(next);
+  }
+  function onUp(): void {
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    document.body.style.removeProperty("cursor");
+    document.body.style.removeProperty("user-select");
+    setResizing(false);
+  }
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp);
+}
+
+// Resolve the artifact panel's CSS width and transition from the persisted
+// width and the live drag state. A null width means "never resized" -> keep
+// the responsive default; once resized, the stored px is clamped against the
+// live container so the chat thread always keeps ARTIFACT_PANEL_MIN_THREAD_WIDTH.
+// The transition is dropped mid-drag so the panel tracks the pointer 1:1.
+function artifactPanelLayout(
+  width: number | null,
+  resizing: boolean,
+): { style: CSSProperties; transition: string } {
+  const widthValue =
+    width === null
+      ? "min(760px, 48vw)"
+      : `clamp(${ARTIFACT_PANEL_MIN_WIDTH}px, ${width}px, calc(100% - ${ARTIFACT_PANEL_MIN_THREAD_WIDTH}px))`;
+  return {
+    style: { "--artifact-panel-width": widthValue } as CSSProperties,
+    transition: resizing
+      ? ""
+      : "transition-[flex-basis,width] duration-[240ms] ease",
+  };
+}
+
+function ArtifactResizeHandle() {
+  const setWidth = useSet(setArtifactPanelWidth$);
+  const setResizing = useSet(setArtifactPanelResizing$);
+  return (
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize preview panel"
+      className="group relative hidden xl:flex w-1 shrink-0 cursor-col-resize items-stretch justify-center"
+      onPointerDown={(event) => {
+        startArtifactPanelResize(event, setWidth, setResizing);
+      }}
+    >
+      <span
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border/60 transition-colors group-hover:bg-border"
+      />
+    </div>
+  );
+}
+
+function ChatThreadArea({
+  leftThread,
+  rightThread,
+  activePresentationEditorUrl,
+  artifactFullscreen,
+  presentationEditor,
+}: {
+  leftThread: ChatThreadSignals | null;
+  rightThread: ChatThreadSignals | null;
+  activePresentationEditorUrl: string | null;
+  artifactFullscreen: boolean;
+  presentationEditor: ReactNode;
+}) {
+  const setKeyboardScrollRoot = useSet(setChatKeyboardScrollRoot$);
+  const setMainThreadKeyboardFocusRef = useSet(
+    setMainChatThreadKeyboardFocusRef$,
+  );
+
+  return (
+    <div
+      ref={setKeyboardScrollRoot}
+      className="flex w-full flex-1 min-w-0 min-h-0 bg-transparent"
+    >
+      {activePresentationEditorUrl ? (
+        !artifactFullscreen || typeof document === "undefined" ? (
+          presentationEditor
+        ) : null
+      ) : (
+        <>
+          {leftThread && (
+            <ChatThread
+              key={leftThread.threadId}
+              thread={leftThread}
+              onFocusFallbackRef={setMainThreadKeyboardFocusRef}
+            />
+          )}
+          {rightThread && (
+            <>
+              <div className="w-px shrink-0 bg-border/60" aria-hidden="true" />
+              <ChatThread key={rightThread.threadId} thread={rightThread} />
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+export function ZeroChatThreadPage() {
+  const leftThread = useGet(currentLeftThread$);
+  const rightThread = useGet(currentRightThread$);
+  const lightboxUrl = useGet(attachmentLightboxUrl$);
+  const artifactRef = useGet(currentArtifactRef$);
+  const artifactInboxThreadId = useGet(currentArtifactInboxThreadId$);
+  const automationPanelThreadId = useGet(currentHeaderAutomationThreadId$);
+  const presentationEditorUrl = useGet(currentPresentationEditorUrl$);
+  const closePresentationEditor = useSet(closePresentationEditor$);
+  const artifactFullscreen = useGet(artifactFullscreen$);
+  const activePresentationEditorUrl = presentationEditorUrl;
+  const artifactPanelOpen =
+    artifactRef !== null || artifactInboxThreadId !== null;
+  const automationPanelOpen = automationPanelThreadId !== null;
+  const rightPanelOpen = artifactPanelOpen || automationPanelOpen;
+  const { style: artifactPanelStyle, transition: artifactTransition } =
+    artifactPanelLayout(
+      useGet(artifactPanelWidth$),
+      useGet(artifactPanelResizing$),
+    );
+  const presentationEditor = activePresentationEditorUrl ? (
+    <div
+      data-testid="presentation-editor-container"
+      className={cn(
+        "flex min-w-0 overflow-hidden bg-background",
+        artifactFullscreen
+          ? ARTIFACT_FULLSCREEN_SHELL_CLASSNAME
+          : "h-full w-full flex-1",
+      )}
+    >
+      <PresentationHtmlEditor
+        url={activePresentationEditorUrl}
+        onClose={closePresentationEditor}
+      />
+    </div>
+  ) : null;
+
+  return (
+    <>
+      {/* Keep the wrapper structure stable across right panel open/close so the
+          thread area's React subtree (and its scroll/keyboard state) never
+          unmounts when the sidebar appears. Only the wrapper className and
+          the optional sidebar sibling change with state. Below xl: the
+          thread half hides so the sidebar fills the pane (no toggle, the
+          50/50 split needs each half ~640px to clear the composer's sm:
+          breakpoint, below which the model picker collapses to icons). */}
+      <div
+        className="flex flex-1 min-h-0 bg-transparent"
+        style={artifactPanelStyle}
+      >
+        <div
+          className={cn(
+            "min-w-0 min-h-0",
+            artifactTransition,
+            rightPanelOpen ? "hidden xl:flex flex-1 basis-0" : "flex flex-1",
+          )}
+        >
+          <ChatThreadArea
+            leftThread={leftThread}
+            rightThread={rightThread}
+            activePresentationEditorUrl={activePresentationEditorUrl}
+            artifactFullscreen={artifactFullscreen}
+            presentationEditor={presentationEditor}
+          />
+        </div>
+        {rightPanelOpen && <ArtifactResizeHandle />}
+        <div
+          className={cn(
+            "flex min-h-0 min-w-0 overflow-hidden",
+            artifactTransition,
+            rightPanelOpen
+              ? "flex-1 basis-0 xl:w-[var(--artifact-panel-width)] xl:flex-none xl:basis-[var(--artifact-panel-width)]"
+              : "pointer-events-none w-0 flex-none basis-0",
+          )}
+          aria-hidden={!rightPanelOpen}
+        >
+          {automationPanelOpen && automationPanelThreadId ? (
+            <HeaderAutomationSidebar threadId={automationPanelThreadId} />
+          ) : artifactPanelOpen ? (
+            <ChatArtifactInboxSlot
+              artifactRef={artifactRef}
+              leftThread={leftThread}
+              rightThread={rightThread}
+            />
+          ) : null}
+        </div>
+      </div>
+      {lightboxUrl && <AttachmentLightbox />}
+      {activePresentationEditorUrl &&
+        artifactFullscreen &&
+        typeof document !== "undefined" &&
+        presentationEditor &&
+        createPortal(presentationEditor, document.body)}
+      <ChatConnectorActionConnectModal />
+    </>
+  );
+}
+
+type LoadableValue<T> =
+  | { state: "loading" }
+  | { state: "hasData"; data: T }
+  | { state: "hasError"; error: unknown };
+
+function resolveSessionError(
+  threadSettledInServerLoadable: LoadableValue<boolean>,
+  renderedGroupsReadyLoadable: LoadableValue<boolean>,
+): string | null {
+  if (threadSettledInServerLoadable.state === "hasError") {
+    return threadSettledInServerLoadable.error instanceof Error
+      ? threadSettledInServerLoadable.error.message
+      : "Failed to load chat";
+  }
+  if (renderedGroupsReadyLoadable.state === "hasError") {
+    return renderedGroupsReadyLoadable.error instanceof Error
+      ? renderedGroupsReadyLoadable.error.message
+      : "Failed to load messages";
+  }
+  return null;
+}
+
+const CHAT_THREAD_CONTENT_MAIN_CLASS =
+  "items-center py-4 pl-4 pr-4 sm:pl-6 sm:pr-6 @container";
+const CHAT_RENDER_LOAD_MORE_TOP_THRESHOLD_PX = 100;
+
+function ChatThreadRenderedMessageGroups({
+  thread,
+}: {
+  thread: ChatThreadSignals;
+}) {
+  const renderedGroups =
+    useLastResolved(thread.visibleRenderedChatGroups$, {
+      equalityFn: equalArrays,
+    }) ?? [];
+  const { activeGroups: renderedActiveGroups } =
+    splitQueuedMessagesForThinkingIndicator(renderedGroups);
+  const runGroupExpandedKeys = useGet(runGroupExpandedKeys$);
+  const toggleRunGroupExpanded = useSet(toggleRunGroupExpanded$);
+  const runGroupFolding = buildRunGroupFolding(
+    renderedActiveGroups,
+    runGroupExpandedKeys,
+  );
+  const runGroupVisibleGroups =
+    runGroupFolding?.visibleGroups ?? renderedActiveGroups;
+  const completedWorkFolding = buildCompletedWorkFolding(runGroupVisibleGroups);
+  const completedWorkExpandedKeys = useGet(completedWorkExpandedKeys$);
+  const toggleCompletedWorkExpanded = useSet(toggleCompletedWorkExpanded$);
+  const visibleGroups =
+    completedWorkFolding?.visibleGroups ?? runGroupVisibleGroups;
+
+  return (
+    <ChatThreadMessageGroups
+      thread={thread}
+      groups={visibleGroups}
+      runGroupFolding={runGroupFolding}
+      runGroupExpandedKeys={runGroupExpandedKeys}
+      onToggleRunGroup={toggleRunGroupExpanded}
+      completedWorkFolding={completedWorkFolding}
+      completedWorkExpandedKeys={completedWorkExpandedKeys}
+      onToggleCompletedWork={toggleCompletedWorkExpanded}
+    />
+  );
+}
+
+function ChatThreadSessionError({ thread }: { thread: ChatThreadSignals }) {
+  const renderedGroupsReadyLoadable = useLastLoadable(
+    thread.visibleRenderedChatGroupsReady$,
+  );
+  const threadSettledInServerLoadable = useLastLoadable(
+    thread.threadSettledInServer$,
+  );
+  const sessionError = resolveSessionError(
+    threadSettledInServerLoadable,
+    renderedGroupsReadyLoadable,
+  );
+  if (!sessionError) {
+    return null;
+  }
+  return (
+    <div className="flex-1 flex items-center justify-center py-16">
+      <div className="flex items-center gap-2 text-destructive">
+        <IconAlertCircle size={16} />
+        <p className="text-sm">{sessionError}</p>
+      </div>
+    </div>
+  );
+}
+
+function ChatThreadEmptyState({ thread }: { thread: ChatThreadSignals }) {
+  const renderedGroupsReady =
+    useLastResolved(thread.visibleRenderedChatGroupsReady$) ?? false;
+  const threadSettledInServer =
+    useLastResolved(thread.threadSettledInServer$) ?? false;
+  const hasMessages = useLastResolved(thread.hasMessages$);
+  if (!renderedGroupsReady || !threadSettledInServer || hasMessages !== false) {
+    return null;
+  }
+  return (
+    <div className="flex-1 flex flex-col items-center justify-center py-16 gap-3">
+      <img
+        src={emptyChatImg}
+        alt=""
+        role="presentation"
+        loading="lazy"
+        className="h-24 w-24 object-contain opacity-80"
+      />
+      <p className="text-sm text-muted-foreground">
+        Send a message to start the conversation
+      </p>
+    </div>
+  );
+}
+
+function ChatThreadMessagesMain({ thread }: { thread: ChatThreadSignals }) {
+  const renderedGroupsReady =
+    useLastResolved(thread.visibleRenderedChatGroupsReady$) ?? false;
+
+  return (
+    <main className={CHAT_THREAD_CONTENT_MAIN_CLASS}>
+      <div
+        data-message-container
+        className="w-full max-w-[900px] mx-auto flex flex-col gap-6 pb-4 overflow-visible"
+        style={{ visibility: renderedGroupsReady ? "visible" : "hidden" }}
+      >
+        <ChatThreadSessionError thread={thread} />
+        <ChatThreadEmptyState thread={thread} />
+        <ChatThreadRenderedMessageGroups thread={thread} />
+        <ChatThreadThinkingIndicator thread={thread} />
+      </div>
+    </main>
+  );
+}
+
+function ChatThreadThinkingIndicator({
+  thread,
+}: {
+  thread: ChatThreadSignals;
+}) {
+  return <ThinkingIndicator thread={thread} />;
+}
+
+function ChatThreadMessageGroups({
+  thread,
+  groups,
+  runGroupFolding,
+  runGroupExpandedKeys,
+  onToggleRunGroup,
+  completedWorkFolding,
+  completedWorkExpandedKeys,
+  onToggleCompletedWork,
+}: {
+  thread: ChatThreadSignals;
+  groups: readonly GroupedChatMessageGroup[];
+  runGroupFolding: RunGroupFolding | null;
+  runGroupExpandedKeys: ReadonlySet<string>;
+  onToggleRunGroup: (key: string) => void;
+  completedWorkFolding: CompletedWorkFolding | null;
+  completedWorkExpandedKeys: ReadonlySet<string>;
+  onToggleCompletedWork: (key: string) => void;
+}) {
+  const { embeddedRunGroupFolds, externalRunGroupFolds } =
+    resolveRunGroupFoldPlacements({
+      groups,
+      runGroupFolding,
+      runGroupExpandedKeys,
+      onToggleRunGroup,
+    });
+
+  return (
+    <>
+      {groups.map((group) => {
+        const runGroupFolds =
+          externalRunGroupFolds.get(group.beginMessageId) ?? [];
+        const embeddedFolds =
+          embeddedRunGroupFolds.get(group.beginMessageId) ?? [];
+        const completedWorkFold = completedWorkFoldForGroup(
+          completedWorkFolding,
+          group,
+        );
+        const completedWorkExpanded =
+          completedWorkFold !== null &&
+          completedWorkExpandedKeys.has(completedWorkFold.key);
+        return (
+          <div key={group.beginMessageId} className="contents">
+            {runGroupFolds.map((runGroupFold) => {
+              return (
+                <RunGroupFoldRow
+                  key={runGroupFold.fold.key}
+                  control={runGroupFold}
+                />
+              );
+            })}
+            <PagedGroupRow
+              group={group}
+              thread={thread}
+              runGroupFolds={embeddedFolds}
+              completedWorkFold={
+                completedWorkFold !== null
+                  ? {
+                      groups: completedWorkFold.labelGroups,
+                      hiddenGroups: completedWorkFold.hiddenGroups,
+                      expanded: completedWorkExpanded,
+                      onToggle: () => {
+                        onToggleCompletedWork(completedWorkFold.key);
+                      },
+                    }
+                  : undefined
+              }
+            />
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+interface RunGroupFoldControl {
+  fold: RunGroupFold;
+  expanded: boolean;
+  onToggle: () => void;
+}
+
+function resolveRunGroupFoldPlacements({
+  groups,
+  runGroupFolding,
+  runGroupExpandedKeys,
+  onToggleRunGroup,
+}: {
+  groups: readonly GroupedChatMessageGroup[];
+  runGroupFolding: RunGroupFolding | null;
+  runGroupExpandedKeys: ReadonlySet<string>;
+  onToggleRunGroup: (key: string) => void;
+}): {
+  embeddedRunGroupFolds: Map<string, RunGroupFoldControl[]>;
+  externalRunGroupFolds: Map<string, RunGroupFoldControl[]>;
+} {
+  const embeddedRunGroupFolds = new Map<string, RunGroupFoldControl[]>();
+  const externalRunGroupFolds = new Map<string, RunGroupFoldControl[]>();
+
+  if (runGroupFolding === null) {
+    return { embeddedRunGroupFolds, externalRunGroupFolds };
+  }
+
+  for (const [index, group] of groups.entries()) {
+    const folds = runGroupFolding.foldsByNextGroupId.get(group.beginMessageId);
+    if (!folds || folds.length === 0) {
+      continue;
+    }
+
+    for (const fold of folds) {
+      const control: RunGroupFoldControl = {
+        fold,
+        expanded: runGroupExpandedKeys.has(fold.key),
+        onToggle: () => {
+          onToggleRunGroup(fold.key);
+        },
+      };
+      const embeddedGroupId = control.expanded
+        ? undefined
+        : inlineGroupIdForCollapsedRunGroupFold(groups, index);
+      const target = embeddedGroupId
+        ? embeddedRunGroupFolds
+        : externalRunGroupFolds;
+      const targetGroupId = embeddedGroupId ?? group.beginMessageId;
+      const existing = target.get(targetGroupId);
+      if (existing) {
+        existing.push(control);
+      } else {
+        target.set(targetGroupId, [control]);
+      }
+    }
+  }
+
+  return { embeddedRunGroupFolds, externalRunGroupFolds };
+}
+
+function inlineGroupIdForCollapsedRunGroupFold(
+  groups: readonly GroupedChatMessageGroup[],
+  index: number,
+): string | undefined {
+  const group = groups[index];
+  if (!group || group.role !== "user") {
+    return undefined;
+  }
+  if (firstRunIdForMessages(group.messages) === undefined) {
+    return undefined;
+  }
+  return (
+    assistantGroupIdForCollapsedRunGroupFold(groups, index) ??
+    group.beginMessageId
+  );
+}
+
+function assistantGroupIdForCollapsedRunGroupFold(
+  groups: readonly GroupedChatMessageGroup[],
+  index: number,
+): string | undefined {
+  const group = groups[index];
+  if (!group || group.role !== "user") {
+    return undefined;
+  }
+  const runId = firstRunIdForMessages(group.messages);
+  if (runId === undefined) {
+    return undefined;
+  }
+
+  for (let nextIndex = index + 1; nextIndex < groups.length; nextIndex++) {
+    const candidate = groups[nextIndex]!;
+    const candidateRunId = firstRunIdForMessages(candidate.messages);
+    if (candidateRunId !== runId) {
+      return undefined;
+    }
+    if (candidate.role === "assistant") {
+      return candidate.beginMessageId;
+    }
+  }
+
+  return undefined;
+}
+
+function completedWorkFoldForGroup(
+  completedWorkFolding: CompletedWorkFolding | null,
+  group: GroupedChatMessageGroup,
+): CompletedWorkFold | null {
+  if (completedWorkFolding === null) {
+    return null;
+  }
+  return (
+    group.messages
+      .map((message) => {
+        return completedWorkFolding.foldsByFinalMessageId.get(message.id);
+      })
+      .find((fold) => {
+        return fold !== undefined;
+      }) ?? null
+  );
+}
+
+function groupMessagesByRole(
+  messages: readonly EnrichedChatMessage[],
+): GroupedChatMessageGroup[] {
+  const groups: GroupedChatMessageGroup[] = [];
+  for (const message of messages) {
+    const last = groups[groups.length - 1];
+    if (last && last.role === message.role) {
+      last.messages.push(message);
+      continue;
+    }
+    groups.push({
+      beginMessageId: message.id,
+      role: message.role,
+      messages: [message],
+    });
+  }
+  return groups;
+}
+
+interface CompletedWorkFold {
+  key: string;
+  finalMessageId: string;
+  hiddenGroups: GroupedChatMessageGroup[];
+  labelGroups: GroupedChatMessageGroup[];
+}
+
+interface CompletedWorkFolding {
+  visibleGroups: GroupedChatMessageGroup[];
+  foldsByFinalMessageId: Map<string, CompletedWorkFold>;
+}
+
+function groupMessagesForCompletedWorkDisplay(
+  messages: readonly EnrichedChatMessage[],
+  foldFinalMessageIds: ReadonlySet<string>,
+): GroupedChatMessageGroup[] {
+  const groups: GroupedChatMessageGroup[] = [];
+  for (const message of messages) {
+    const forceStandalone = foldFinalMessageIds.has(message.id);
+    const last = groups[groups.length - 1];
+    const lastHasFoldFinal =
+      last?.messages.some((candidate) => {
+        return foldFinalMessageIds.has(candidate.id);
+      }) ?? false;
+
+    if (
+      !forceStandalone &&
+      last &&
+      last.role === message.role &&
+      !lastHasFoldFinal
+    ) {
+      last.messages.push(message);
+      continue;
+    }
+
+    groups.push({
+      beginMessageId: message.id,
+      role: message.role,
+      messages: [message],
+    });
+  }
+  return groups;
+}
+
+function firstRunIdForMessages(
+  messages: readonly EnrichedChatMessage[],
+): string | undefined {
+  return messages.find((message) => {
+    return message.runId !== undefined;
+  })?.runId;
+}
+
+function usageByRunIdFromGroups(
+  groups: readonly GroupedChatMessageGroup[],
+): Map<string, ChatMessageUsagePayload> {
+  const usageByRunId = new Map<string, ChatMessageUsagePayload>();
+  for (const group of groups) {
+    if (group.role !== "assistant" || group.usage === undefined) {
+      continue;
+    }
+    const runId = firstRunIdForMessages(group.messages);
+    if (runId !== undefined) {
+      setLatestUsageForRun(usageByRunId, runId, group.usage);
+    }
+  }
+  return usageByRunId;
+}
+
+function usageSettledAtMs(usage: ChatMessageUsagePayload): number {
+  const timestamp = Date.parse(usage.settledAt);
+  return Number.isNaN(timestamp) ? 0 : timestamp;
+}
+
+function setLatestUsageForRun(
+  usageByRunId: Map<string, ChatMessageUsagePayload>,
+  runId: string,
+  usage: ChatMessageUsagePayload,
+): void {
+  const existing = usageByRunId.get(runId);
+  if (
+    existing === undefined ||
+    usageSettledAtMs(usage) >= usageSettledAtMs(existing)
+  ) {
+    usageByRunId.set(runId, usage);
+  }
+}
+
+function attachUsageToCompletedWorkGroups(
+  groups: readonly GroupedChatMessageGroup[],
+  usageByRunId: ReadonlyMap<string, ChatMessageUsagePayload>,
+): GroupedChatMessageGroup[] {
+  return groups.map((group) => {
+    if (group.role !== "assistant") {
+      return group;
+    }
+    const runId = firstRunIdForMessages(group.messages);
+    const usage = runId === undefined ? undefined : usageByRunId.get(runId);
+    return usage === undefined ? group : { ...group, usage };
+  });
+}
+
+function isRenderableAssistantMessage(message: EnrichedChatMessage): boolean {
+  return (
+    message.role === "assistant" &&
+    (Boolean(message.content) ||
+      Boolean(message.error) ||
+      Boolean(message.mailDraft))
+  );
+}
+
+function isThinkingOnlyAssistantMessage(message: EnrichedChatMessage): boolean {
+  return (
+    message.role === "assistant" &&
+    message.content === null &&
+    message.error === undefined &&
+    typeof message.thinking === "string" &&
+    message.thinking.trim().length > 0
+  );
+}
+
+function terminatedRunIdsForCompletedWork(
+  messages: readonly EnrichedChatMessage[],
+): Set<string> {
+  const terminatedRunIds = new Set<string>();
+  for (const message of messages) {
+    if (message.interruptsRunId !== undefined) {
+      terminatedRunIds.add(message.interruptsRunId);
+    }
+    if (
+      message.role === "assistant" &&
+      message.runId !== undefined &&
+      message.runLifecycleEvent !== undefined
+    ) {
+      terminatedRunIds.add(message.runId);
+    }
+  }
+  return terminatedRunIds;
+}
+
+function buildCompletedWorkFolding(
+  groups: readonly GroupedChatMessageGroup[],
+): CompletedWorkFolding | null {
+  const usageByRunId = usageByRunIdFromGroups(groups);
+  const messages = groups.flatMap((group) => {
+    return group.messages;
+  });
+  const terminatedRunIds = terminatedRunIdsForCompletedWork(messages);
+  const visibleMessages: EnrichedChatMessage[] = [];
+  const folds: CompletedWorkFold[] = [];
+
+  for (let index = 0; index < messages.length; ) {
+    const runId = messages[index]!.runId;
+    if (runId === undefined) {
+      visibleMessages.push(messages[index]!);
+      index++;
+      continue;
+    }
+
+    let endIndex = index + 1;
+    while (endIndex < messages.length && messages[endIndex]!.runId === runId) {
+      endIndex++;
+    }
+
+    const runMessages = messages.slice(index, endIndex);
+    if (!terminatedRunIds.has(runId)) {
+      visibleMessages.push(...runMessages);
+      index = endIndex;
+      continue;
+    }
+
+    let finalMessageIndex = -1;
+    for (let offset = runMessages.length - 1; offset >= 0; offset--) {
+      if (isRenderableAssistantMessage(runMessages[offset]!)) {
+        finalMessageIndex = offset;
+        break;
+      }
+    }
+    const finalMessage =
+      finalMessageIndex >= 0 ? runMessages[finalMessageIndex]! : undefined;
+    const precedingMessages =
+      finalMessageIndex > 0 ? runMessages.slice(0, finalMessageIndex) : [];
+    const hiddenMessages = precedingMessages.filter((message) => {
+      return (
+        message.role !== "user" && !isThinkingOnlyAssistantMessage(message)
+      );
+    });
+    const trailingMessages =
+      finalMessageIndex >= 0 ? runMessages.slice(finalMessageIndex + 1) : [];
+    const trailingMessagesAreMarkers = trailingMessages.every((message) => {
+      return (
+        message.role === "assistant" && !isRenderableAssistantMessage(message)
+      );
+    });
+    if (
+      finalMessage !== undefined &&
+      hiddenMessages.length > 0 &&
+      trailingMessagesAreMarkers
+    ) {
+      visibleMessages.push(
+        ...precedingMessages.filter((message) => {
+          return message.role === "user";
+        }),
+        finalMessage,
+      );
+      folds.push({
+        key: `${runId}:${finalMessage.id}`,
+        finalMessageId: finalMessage.id,
+        hiddenGroups: groupMessagesByRole(hiddenMessages),
+        labelGroups: groupMessagesByRole(runMessages),
+      });
+    } else {
+      visibleMessages.push(...runMessages);
+    }
+
+    index = endIndex;
+  }
+
+  if (folds.length === 0) {
+    return null;
+  }
+
+  const foldFinalMessageIds = new Set(
+    folds.map((fold) => {
+      return fold.finalMessageId;
+    }),
+  );
+  return {
+    visibleGroups: attachUsageToCompletedWorkGroups(
+      groupMessagesForCompletedWorkDisplay(
+        visibleMessages,
+        foldFinalMessageIds,
+      ),
+      usageByRunId,
+    ),
+    foldsByFinalMessageId: new Map(
+      folds.map((fold) => {
+        return [fold.finalMessageId, fold];
+      }),
+    ),
+  };
+}
+
+function parseMessageTime(value: string): number | null {
+  const timestamp = Date.parse(value);
+  return Number.isNaN(timestamp) ? null : timestamp;
+}
+
+function formatCompactDuration(totalSeconds: number): string {
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
+  }
+  const totalMinutes = Math.round(totalSeconds / 60);
+  if (totalMinutes < 60) {
+    return `${totalMinutes}m`;
+  }
+  const totalHours = Math.round(totalMinutes / 60);
+  return `${totalHours}h`;
+}
+
+function durationLabelForGroups(
+  groups: readonly GroupedChatMessageGroup[],
+): string | null {
+  const timestamps = groups.flatMap((group) => {
+    return group.messages.flatMap((message) => {
+      const timestamp = parseMessageTime(message.createdAt);
+      return timestamp === null ? [] : [timestamp];
+    });
+  });
+  if (timestamps.length < 2) {
+    return null;
+  }
+  const elapsedSeconds = Math.max(
+    1,
+    Math.round((Math.max(...timestamps) - Math.min(...timestamps)) / 1000),
+  );
+  return formatCompactDuration(elapsedSeconds);
+}
+
+function completedWorkLabel(
+  groups: readonly GroupedChatMessageGroup[],
+): string {
+  const duration = durationLabelForGroups(groups);
+  return duration ? `Worked for ${duration}` : "Worked";
+}
+
+const RUN_SECTION_LABEL_CLASS =
+  "shrink-0 font-serif text-[13px] italic text-muted-foreground/50";
+
+function CompletedWorkFoldRow({
+  groups,
+  expanded,
+  onToggle,
+}: {
+  groups: readonly GroupedChatMessageGroup[];
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const label = completedWorkLabel(groups);
+  return (
+    <div data-chat-completed-work-fold className="-mx-2 @[900px]:-mb-[15px]">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        aria-label={expanded ? "Collapse work history" : "Expand work history"}
+        onClick={onToggle}
+        className="mt-1.5 inline-flex min-h-9 items-center gap-2 rounded-lg px-2 py-1.5 text-muted-foreground transition-colors hover:bg-muted/50"
+      >
+        <IconHourglass
+          aria-hidden
+          size={14}
+          className="shrink-0 text-muted-foreground/70"
+        />
+        <span className="text-[13px]">{label}</span>
+        <IconChevronRight
+          aria-hidden
+          size={14}
+          className={cn(
+            "shrink-0 text-muted-foreground/70 transition-transform",
+            expanded && "rotate-90",
+          )}
+        />
+      </button>
+    </div>
+  );
+}
+
+function normalizedInlineLabel(value: string): string {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+function runGroupFoldMessages(fold: RunGroupFold): EnrichedChatMessage[] {
+  return fold.labelGroups.flatMap((group) => {
+    return group.messages;
+  });
+}
+
+function runGroupFoldSourceLabel(fold: RunGroupFold): string {
+  const messages = runGroupFoldMessages(fold);
+  const workflowLabel = runGroupFoldWorkflowLabel(fold);
+  if (workflowLabel) {
+    return workflowLabel;
+  }
+  const userMessage = messages.find((message) => {
+    return message.role === "user" && (message.content?.trim().length ?? 0) > 0;
+  });
+  const content = userMessage?.content?.trim();
+  return content ? normalizedInlineLabel(content) : "Automated run";
+}
+
+function runGroupFoldWorkflowLabel(fold: RunGroupFold): string | null {
+  for (const message of runGroupFoldMessages(fold)) {
+    if (isWorkflowUserMessage(message)) {
+      return normalizedInlineLabel(workflowMessageBody(message));
+    }
+    const workflowSnapshot = message.workflowSnapshot;
+    const label =
+      workflowSnapshot?.triggerBrief?.trim() ||
+      workflowSnapshot?.description?.trim() ||
+      workflowSnapshot?.displayName?.trim() ||
+      workflowSnapshot?.name?.trim();
+    if (label) {
+      return normalizedInlineLabel(label);
+    }
+  }
+  return null;
+}
+
+function runGroupFoldGoalLabel(fold: RunGroupFold): string {
+  const goalMessage = runGroupFoldMessages(fold).find(isGoalUserMessage);
+  const content = goalMessage ? goalUserMessageBrief(goalMessage) : null;
+  return content ? normalizedInlineLabel(content) : "goal";
+}
+
+function goalUserMessageBrief(message: EnrichedChatMessage): string | null {
+  return (
+    message.goalSnapshot?.objectiveBrief?.trim() ||
+    message.content?.trim() ||
+    null
+  );
+}
+
+function isGoalUserMessage(
+  message: EnrichedChatMessage,
+): message is EnrichedChatMessage & { role: "user" } {
+  return (
+    message.role === "user" &&
+    message.isGoalRun === true &&
+    !hasWorkflowMessageMetadata(message) &&
+    goalUserMessageBrief(message) !== null
+  );
+}
+
+function isGoalRunGroupFold(fold: RunGroupFold): boolean {
+  return fold.labelGroups.some((group) => {
+    return group.messages.some(isGoalUserMessage);
+  });
+}
+
+function verboseDurationLabelForRunGroupFold(
+  fold: RunGroupFold,
+): string | null {
+  const timestamps = fold.labelGroups.flatMap((group) => {
+    return group.messages.flatMap((message) => {
+      if (message.runGroupId !== fold.runGroupId) {
+        return [];
+      }
+      const timestamp = parseMessageTime(message.createdAt);
+      return timestamp === null ? [] : [timestamp];
+    });
+  });
+  if (timestamps.length < 2) {
+    return null;
+  }
+  const elapsedMinutes = Math.max(
+    1,
+    Math.round((Math.max(...timestamps) - Math.min(...timestamps)) / 60_000),
+  );
+  const hours = Math.floor(elapsedMinutes / 60);
+  const minutes = elapsedMinutes % 60;
+  const parts: string[] = [];
+  if (hours > 0) {
+    parts.push(`${hours} ${hours === 1 ? "hour" : "hours"}`);
+  }
+  if (minutes > 0 || parts.length === 0) {
+    parts.push(`${minutes} ${minutes === 1 ? "min" : "mins"}`);
+  }
+  return parts.join(" ");
+}
+
+function runGroupFoldLabel(fold: RunGroupFold): string {
+  if (isGoalRunGroupFold(fold)) {
+    const duration = verboseDurationLabelForRunGroupFold(fold);
+    const label = runGroupFoldGoalLabel(fold);
+    return duration ? `${duration} for ${label}` : `Goal for ${label}`;
+  }
+  const runLabel = fold.hiddenRunCount === 1 ? "run" : "runs";
+  const sourceLabel = runGroupFoldSourceLabel(fold);
+  return `${fold.hiddenRunCount} ${runLabel} for ${sourceLabel}`;
+}
+
+function RunGroupFoldRow({
+  control,
+  embedded = false,
+}: {
+  control: RunGroupFoldControl;
+  embedded?: boolean;
+}) {
+  const { fold, expanded, onToggle } = control;
+  const label = runGroupFoldLabel(fold);
+  const isGoal = isGoalRunGroupFold(fold);
+  const Icon = isGoal ? IconTarget : IconPackage;
+  return (
+    <div
+      data-chat-run-group-fold
+      className={cn("-mx-2", embedded && "@[900px]:-mb-[15px]")}
+    >
+      <button
+        type="button"
+        aria-expanded={expanded}
+        aria-label={
+          expanded
+            ? "Collapse grouped run history"
+            : "Expand grouped run history"
+        }
+        onClick={onToggle}
+        className={cn(
+          "inline-flex min-h-9 max-w-full items-center gap-2 rounded-lg px-2 py-1.5 text-muted-foreground transition-colors hover:bg-muted/50",
+          embedded && "mt-1.5",
+        )}
+      >
+        <Icon
+          aria-hidden
+          size={14}
+          className="shrink-0 text-muted-foreground/70"
+        />
+        <span className="min-w-0 truncate whitespace-nowrap text-[13px]">
+          {label}
+        </span>
+        <IconChevronRight
+          aria-hidden
+          size={14}
+          className={cn(
+            "shrink-0 text-muted-foreground/70 transition-transform",
+            expanded && "rotate-90",
+          )}
+        />
+      </button>
+    </div>
+  );
+}
+
+function ChatThreadSkeletonOverlay({ thread }: { thread: ChatThreadSignals }) {
+  const renderedGroupsReadyLoadable = useLastLoadable(
+    thread.visibleRenderedChatGroupsReady$,
+  );
+  const threadSettledInServerLoadable = useLastLoadable(
+    thread.threadSettledInServer$,
+  );
+  const sessionError = resolveSessionError(
+    threadSettledInServerLoadable,
+    renderedGroupsReadyLoadable,
+  );
+  const skeletonVisible = renderedGroupsReadyLoadable.state === "loading";
+  if (!skeletonVisible || sessionError) {
+    return null;
+  }
+
+  return (
+    <div
+      data-chat-skeleton
+      className="absolute inset-0 z-10 overflow-hidden pointer-events-none bg-background"
+    >
+      <main className={CHAT_THREAD_CONTENT_MAIN_CLASS}>
+        <div className="w-full max-w-[900px] mx-auto flex flex-col gap-6 pb-4">
+          <ChatSkeleton />
+        </div>
+      </main>
+    </div>
+  );
+}
+
+function ChatThreadMessagesPane({ thread }: { thread: ChatThreadSignals }) {
+  const setScrollContainer = useSet(thread.setScrollContainer$);
+  const loadMoreRenderedChatGroups = useSet(thread.loadMoreRenderedChatGroups$);
+  const pageSignal = useGet(pageSignal$);
+
+  const handleScroll = (event: ReactUIEvent<HTMLDivElement>) => {
+    if (
+      event.currentTarget.scrollTop > CHAT_RENDER_LOAD_MORE_TOP_THRESHOLD_PX
+    ) {
+      return;
+    }
+    detach(loadMoreRenderedChatGroups(pageSignal), Reason.DomCallback);
+  };
+
+  return (
+    <div className="flex-1 min-h-0 relative isolate">
+      <div
+        ref={setScrollContainer}
+        data-scroll-container
+        tabIndex={-1}
+        onScroll={handleScroll}
+        className="absolute inset-0 overflow-y-auto focus:outline-none [overflow-anchor:none] [scrollbar-gutter:stable]"
+      >
+        <ChatThreadMessagesMain thread={thread} />
+      </div>
+      <ChatThreadSkeletonOverlay thread={thread} />
+      <ScrollToBottomButton thread={thread} />
+    </div>
+  );
+}
+
+function ChatThreadContent({ thread }: { thread: ChatThreadSignals }) {
+  return (
+    <>
+      <ChatThreadHeader thread={thread} />
+
+      <div className="relative min-h-0 flex-1">
+        <div className="flex h-full min-w-0 flex-col">
+          <ChatThreadMessagesPane thread={thread} />
+          <ChatThreadComposer thread={thread} />
+        </div>
+      </div>
+
+      <ChatFeedbackSelection />
+    </>
+  );
+}
+
+function ScrollToBottomButton({ thread }: { thread: ChatThreadSignals }) {
+  const awayFromBottom = useGet(thread.awayFromBottom$);
+  const scrollToBottom = useSet(thread.scrollToBottom$);
+  const renderedGroupsReadyLoadable = useLastLoadable(
+    thread.visibleRenderedChatGroupsReady$,
+  );
+  const threadSettledInServerLoadable = useLastLoadable(
+    thread.threadSettledInServer$,
+  );
+  const sessionError = resolveSessionError(
+    threadSettledInServerLoadable,
+    renderedGroupsReadyLoadable,
+  );
+  const skeletonVisible = renderedGroupsReadyLoadable.state === "loading";
+
+  if (!awayFromBottom || skeletonVisible || sessionError) {
+    return null;
+  }
+
+  return (
+    <button
+      type="button"
+      data-scroll-to-bottom
+      aria-label="Scroll to bottom"
+      onClick={() => {
+        scrollToBottom();
+      }}
+      className="absolute bottom-4 left-1/2 z-20 flex h-9 w-9 -translate-x-1/2 items-center justify-center rounded-full border border-border bg-background text-muted-foreground shadow-md transition-colors hover:bg-accent hover:text-foreground"
+    >
+      <IconArrowDown size={18} />
+    </button>
+  );
+}
+
+function RecommendedFollowupIcon({
+  followup,
+}: {
+  followup: RecommendedFollowup;
+}) {
+  if (followup.kind !== "generate") {
+    return <IconMessageCircle size={14} stroke={1.8} />;
+  }
+
+  if (followup.generationType === "image") {
+    return <IconPhoto size={14} stroke={1.8} />;
+  }
+  if (followup.generationType === "video") {
+    return <IconVideo size={14} stroke={1.8} />;
+  }
+  if (followup.generationType === "presentation") {
+    return <IconChartLine size={14} stroke={1.8} />;
+  }
+  if (followup.generationType === "website") {
+    return <IconLink size={14} stroke={1.8} />;
+  }
+  return <IconPackage size={14} stroke={1.8} />;
+}
+
+function recommendedFollowupShownKey(
+  source: RecommendedFollowupSource,
+): string {
+  return [
+    source.messageId,
+    source.followups.length,
+    ...source.followups.map((followup) => {
+      return `${followup.kind}:${followup.generationType ?? ""}`;
+    }),
+  ].join("|");
+}
+
+function reportRecommendedFollowupsShown(
+  element: HTMLDivElement | null,
+  source: RecommendedFollowupSource,
+): void {
+  if (!element) {
+    return;
+  }
+
+  const shownKey = recommendedFollowupShownKey(source);
+  if (element.dataset.recommendedFollowupsShownKey === shownKey) {
+    return;
+  }
+  element.dataset.recommendedFollowupsShownKey = shownKey;
+
+  captureRecommendedFollowupsShown({
+    messageId: source.messageId,
+    followups: source.followups,
+  });
+}
+
+function RecommendedFollowupList({
+  thread,
+  source,
+}: {
+  thread: ChatThreadSignals;
+  source: RecommendedFollowupSource;
+}) {
+  const sendMessage = useSet(thread.sendMessage$);
+  const rootSignal = useGet(rootSignal$);
+  const handleRecommendedFollowupsRef = (element: HTMLDivElement | null) => {
+    reportRecommendedFollowupsShown(element, source);
+  };
+
+  const handleSelect = (
+    followup: RecommendedFollowup,
+    followupIndex: number,
+  ) => {
+    captureRecommendedFollowupSelected({
+      messageId: source.messageId,
+      followupIndex,
+      followupCount: source.followups.length,
+      followup,
+    });
+    detach(
+      sendMessage(
+        followup.prompt,
+        {
+          includeDraftAttachments: false,
+        },
+        rootSignal,
+      ),
+      Reason.DomCallback,
+    );
+  };
+
+  return (
+    <div ref={handleRecommendedFollowupsRef} className="-mx-2">
+      {source.followups.map((followup, followupIndex) => {
+        return (
+          <button
+            key={followup.prompt}
+            type="button"
+            title={followup.prompt}
+            className="group flex min-h-10 w-full items-center gap-2 rounded-lg px-2 py-2 text-left transition-colors hover:bg-muted/40"
+            onClick={() => {
+              handleSelect(followup, followupIndex);
+            }}
+          >
+            <span className="shrink-0 text-muted-foreground/70 transition-colors group-hover:text-foreground">
+              <RecommendedFollowupIcon followup={followup} />
+            </span>
+            <span className="min-w-0 flex-1 break-words text-[0.9375rem] font-medium leading-6 text-muted-foreground group-hover:text-foreground">
+              {followup.prompt}
+            </span>
+            <IconArrowUpRight
+              size={14}
+              stroke={1.8}
+              className="shrink-0 text-muted-foreground/60 opacity-0 transition-all group-hover:text-foreground group-hover:opacity-100"
+            />
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function splitQueuedMessagesForThinkingIndicator(
+  groups: GroupedChatMessageGroup[],
+): {
+  activeGroups: GroupedChatMessageGroup[];
+  queuedGroups: GroupedChatMessageGroup[];
+} {
+  const activeGroups: GroupedChatMessageGroup[] = [];
+  const queuedMessages: EnrichedChatMessage[] = [];
+
+  for (const group of groups) {
+    if (group.role !== "user") {
+      activeGroups.push(group);
+      continue;
+    }
+
+    const activeMessages: EnrichedChatMessage[] = [];
+    for (const message of group.messages) {
+      if (message.isQueued) {
+        queuedMessages.push(message);
+      } else {
+        activeMessages.push(message);
+      }
+    }
+
+    if (activeMessages.length > 0) {
+      activeGroups.push({
+        ...group,
+        beginMessageId: activeMessages[0]!.id,
+        messages: activeMessages,
+      });
+    }
+  }
+
+  return {
+    activeGroups,
+    queuedGroups:
+      queuedMessages.length > 0
+        ? [
+            {
+              beginMessageId: queuedMessages[0]!.id,
+              role: "user",
+              messages: queuedMessages,
+            },
+          ]
+        : [],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Composer wrapper — reads chat signals from thread prop
+// ---------------------------------------------------------------------------
+
+function canQueueMessage({ sending }: { sending: boolean }): boolean {
+  return sending;
+}
+
+function shouldAutoFocusComposer({
+  autoFocus,
+  hasMessages,
+}: {
+  autoFocus: boolean;
+  hasMessages: boolean;
+}): boolean {
+  return (
+    autoFocus && !hasMessages && !window.matchMedia("(pointer: coarse)").matches
+  );
+}
+
+interface ChatComposerModelPickerConfig {
+  value: ModelProviderSelection | null;
+  onChange: (value: ModelProviderSelection | null) => void;
+  disabled: boolean;
+}
+
+function resolveChatComposerModelPicker(params: {
+  modelSelection: ModelProviderSelection | null;
+  setModelSelection: (value: ModelProviderSelection | null) => void;
+  disabled: boolean;
+}): ChatComposerModelPickerConfig {
+  return {
+    value: params.modelSelection,
+    onChange: params.setModelSelection,
+    disabled: params.disabled,
+  };
+}
+
+function useChatComposerQueue(
+  thread: ChatThreadSignals,
+  queuedMessages: readonly QueuedChatMessageItem[],
+) {
+  const recallMessage = useSet(thread.recallMessage$);
+  const focusInput = useSet(thread.focusInput$);
+  const pageSignal = useGet(pageSignal$);
+
+  const queuedMessagesById = new Map(
+    queuedMessages.map((message) => {
+      return [message.id, message] as const;
+    }),
+  );
+  const queuedItems: QueuedComposerItem[] = Array.from(
+    queuedMessagesById.values(),
+  ).map((message) => {
+    return {
+      id: message.id,
+      text: message.text,
+    };
+  });
+
+  const onRemoveQueuedItem = (id: string) => {
+    if (!queuedMessagesById.has(id)) {
+      return;
+    }
+    detach(
+      (async () => {
+        await recallMessage(id, pageSignal);
+        focusInput();
+      })(),
+      Reason.DomCallback,
+    );
+  };
+
+  return { queuedItems, onRemoveQueuedItem };
+}
+
+// The thread's active goal (folded from goal-state markers, no separate
+// poll) plus its cancel handler. Cancelling pauses the goal through the goal API;
+// the backend then emits a goal_event marker, so the row folds away.
+function useChatComposerActiveGoal(
+  thread: ChatThreadSignals,
+  pageSignal: AbortSignal,
+) {
+  const activeGoalObjective =
+    useLastResolved(thread.activeGoalObjective$) ?? undefined;
+  const activeGoal = activeGoalObjective
+    ? { objective: activeGoalObjective }
+    : undefined;
+  const pauseChatThreadGoal = useSet(pauseChatThreadGoal$);
+  const onCancelActiveGoal = activeGoal
+    ? () => {
+        detach(
+          pauseChatThreadGoal(thread.threadId, pageSignal),
+          Reason.DomCallback,
+        );
+      }
+    : undefined;
+  return { activeGoal, onCancelActiveGoal };
+}
+
+function useChatComposerModel(
+  thread: ChatThreadSignals,
+  pageSignal: AbortSignal,
+) {
+  // Per-thread composer selection comes from the event projection. Read with
+  // useLastResolved so the picker keeps the previous value while realtime
+  // callbacks refetch the thread detail for non-selection fields.
+  const selectedModelResolved = useLastResolved(thread.selectedModel$);
+  const codexFastModeActive =
+    useLastResolved(thread.codexFastModeActive$) ?? false;
+  const baseModelSelection = selectedModelResolved
+    ? { selectedModel: selectedModelResolved }
+    : null;
+  const modelSelection =
+    baseModelSelection && codexFastModeActive
+      ? {
+          ...baseModelSelection,
+          codexServiceTier: "fast" as const,
+        }
+      : baseModelSelection;
+  const setModelSelection = useSet(thread.setModelSelection$);
+  const selectedModelOauthAvailable =
+    useLastResolved(thread.selectedModelOauthAvailable$) ?? true;
+  const configureSelectedModel = useSet(thread.configureSelectedModel$);
+
+  const handleModelSelectionChange = (
+    selection: ModelProviderSelection | null,
+  ): void => {
+    detach(setModelSelection(selection, pageSignal), Reason.DomCallback);
+  };
+
+  const modelPicker = modelSelection
+    ? resolveChatComposerModelPicker({
+        modelSelection,
+        setModelSelection: handleModelSelectionChange,
+        disabled: false,
+      })
+    : undefined;
+  const modelPickerLoading = selectedModelResolved === undefined;
+  const submitBlockerProps =
+    modelSelection && !selectedModelOauthAvailable
+      ? {
+          message:
+            "The selected model is not available. Configure it before sending.",
+          actionLabel: "Model Configure",
+          onAction: () => {
+            detach(configureSelectedModel(pageSignal), Reason.DomCallback);
+          },
+        }
+      : undefined;
+
+  return {
+    modelPicker,
+    modelPickerLoading,
+    submitBlockerProps,
+  };
+}
+
+function useChatThreadComposerSendState({
+  thread,
+  computerUseHostIdForSend,
+  clearComputerUseHostOverride,
+}: {
+  thread: ChatThreadSignals;
+  computerUseHostIdForSend: string | null | undefined;
+  clearComputerUseHostOverride: () => void;
+}) {
+  const [sendLoadable, send] = useLoadableSet(thread.sendMessage$);
+  const [queueLoadable, queueMessage] = useLoadableSet(thread.queueMessage$);
+  const rootSignal = useGet(rootSignal$);
+  const generationTemplate = useGet(thread.draft.generationTemplate$);
+  const setGenerationTemplate = useSet(thread.draft.setGenerationTemplate$);
+
+  const handleSend = (text: string) => {
+    detach(
+      (async () => {
+        const computerUsePatch =
+          computerUseHostIdForSend === undefined
+            ? {}
+            : { computerUseHostId: computerUseHostIdForSend };
+        const sent = await send(text, { ...computerUsePatch }, rootSignal);
+        if (sent) {
+          clearComputerUseHostOverride();
+        }
+      })(),
+      Reason.DomCallback,
+    );
+  };
+
+  const handleQueue = (text: string) => {
+    detach(
+      (async () => {
+        const computerUseHostId = computerUseHostIdForSend;
+        const queued = await queueMessage(text, computerUseHostId, rootSignal);
+        if (queued) {
+          clearComputerUseHostOverride();
+        }
+      })(),
+      Reason.DomCallback,
+    );
+  };
+
+  const handleFeedbackSend = (text: string): Promise<boolean> => {
+    return send(
+      text,
+      {
+        includeDraftAttachments: true,
+      },
+      rootSignal,
+    );
+  };
+
+  return {
+    handleSend,
+    handleQueue,
+    handleFeedbackSend,
+    submissionLoading:
+      sendLoadable.state === "loading" || queueLoadable.state === "loading",
+    templatePicker: {
+      value: generationTemplate,
+      onChange: (value: GenerationTemplateRequest | undefined) => {
+        setGenerationTemplate(value);
+      },
+    },
+  };
+}
+
+function useChatThreadComputerUse(
+  thread: ChatThreadSignals,
+  pageSignal: AbortSignal,
+) {
+  const computerUseHostsLoadable = useLastLoadable(computerUseHosts$);
+  const computerUseHosts =
+    computerUseHostsLoadable.state === "hasData"
+      ? computerUseHostsLoadable.data
+      : [];
+  const storedComputerUseHostId = useLastResolved(thread.computerUseHostId$);
+  const computerUseHostIdExplicit = useGet(thread.computerUseHostIdExplicit$);
+  const selectedComputerUseHostId =
+    computerUseHostsLoadable.state === "hasData" || computerUseHosts.length > 0
+      ? resolveSelectedComputerUseHostId(
+          computerUseHosts,
+          storedComputerUseHostId,
+        )
+      : (storedComputerUseHostId ?? null);
+  const visibleHosts = visibleComputerUseHosts(
+    computerUseHosts,
+    selectedComputerUseHostId,
+  );
+  const setComputerUseHostId = useSet(thread.setComputerUseHostId$);
+  const clearComputerUseHostOverride = useSet(
+    thread.clearComputerUseHostIdOverride$,
+  );
+  const computerUseHostIdForSend = computerUseHostIdExplicit
+    ? selectedComputerUseHostId
+    : undefined;
+  const handleComputerUseHostChange = (hostId: string | null) => {
+    detach(setComputerUseHostId(hostId, pageSignal), Reason.DomCallback);
+  };
+
+  return {
+    selectedComputerUseHostId,
+    computerUseHostIdForSend,
+    clearComputerUseHostOverride,
+    computerUse: {
+      hosts: visibleHosts,
+      loading:
+        computerUseHostsLoadable.state === "loading" &&
+        computerUseHosts.length === 0,
+      selectedHostId: selectedComputerUseHostId,
+      onChange: handleComputerUseHostChange,
+      downloadUrl: ZERO_DESKTOP_DOWNLOAD_URL,
+    },
+  };
+}
+
+// Bridges the global inline-feedback signals to the composer's `feedback` prop.
+// Returns undefined when no feedback is drafted in this thread, so the composer
+// keeps its textarea.
+function useChatThreadComposerFeedback(
+  thread: ChatThreadSignals,
+  sendFeedback: (prompt: string) => Promise<boolean>,
+): ComposerFeedback | undefined {
+  const items = useGet(feedbackItemsValue$);
+  const feedbackThreadId = useGet(feedbackThreadIdValue$);
+  const sendCount = useGet(feedbackSendCountValue$);
+  const setNote = useSet(setFeedbackItemNote$);
+  const removeItem = useSet(removeFeedbackItem$);
+  const compose = useSet(submitFeedback$);
+  const dismiss = useSet(dismissFeedback$);
+
+  // Feedback is owned by the thread it was drafted in; other threads keep their
+  // own composer textarea so a draft never bleeds across chats.
+  if (feedbackThreadId !== thread.threadId) {
+    return undefined;
+  }
+  return {
+    items,
+    sendCount,
+    onChangeNote: (id, note) => {
+      setNote({ id, note });
+    },
+    onRemove: (id) => {
+      removeItem(id);
+    },
+    onSubmit: () => {
+      const prompt = compose();
+      if (prompt === null) {
+        return;
+      }
+      detach(
+        (async () => {
+          if (await sendFeedback(prompt)) {
+            dismiss();
+          }
+        })(),
+        Reason.DomCallback,
+      );
+    },
+    onDismiss: () => {
+      dismiss();
+    },
+  };
+}
+
+function useChatThreadComposerWorkflowPrompt({
+  thread,
+  pageSignal,
+}: {
+  thread: ChatThreadSignals;
+  pageSignal: AbortSignal;
+}): {
+  onCreateWorkflowPrompt: (() => void) | undefined;
+  replaceDraftDialogOpen: boolean;
+  onConfirmReplaceDraft: () => void;
+  onReplaceDialogOpenChange: (open: boolean) => void;
+} {
+  const attachments = useGet(thread.draft.attachments$);
+  const readInput = useSet(thread.draft.readInput$);
+  const setInput = useSet(thread.draft.setInput$);
+  const clearDraft = useSet(thread.draft.clear$);
+  const queueDraftSync = useSet(thread.queueDraftSync$);
+  const focusComposer = useSet(thread.focusInput$);
+  const replaceDraftTarget = useGet(replaceWorkflowPromptDraftTarget$);
+  const setReplaceDraftTarget = useSet(setReplaceWorkflowPromptDraftTarget$);
+  const workflowPromptDraftTarget = `composer:${thread.threadId}`;
+  const replaceDraftDialogOpen =
+    replaceDraftTarget === workflowPromptDraftTarget;
+
+  const applyWorkflowPrompt = () => {
+    clearDraft();
+    setInput(CREATE_WORKFLOW_WITH_CHAT_PROMPT);
+    detach(queueDraftSync(pageSignal), Reason.DomCallback);
+    focusComposer();
+  };
+
+  const handleCreateWorkflowPrompt = () => {
+    if (readInput().trim().length > 0 || attachments.length > 0) {
+      setReplaceDraftTarget(workflowPromptDraftTarget);
+      return;
+    }
+    applyWorkflowPrompt();
+  };
+
+  const handleConfirmReplaceDraft = () => {
+    setReplaceDraftTarget(null);
+    applyWorkflowPrompt();
+  };
+
+  const handleReplaceDialogOpenChange = (open: boolean) => {
+    setReplaceDraftTarget(open ? workflowPromptDraftTarget : null);
+  };
+
+  return {
+    onCreateWorkflowPrompt: handleCreateWorkflowPrompt,
+    replaceDraftDialogOpen,
+    onConfirmReplaceDraft: handleConfirmReplaceDraft,
+    onReplaceDialogOpenChange: handleReplaceDialogOpenChange,
+  };
+}
+
+const EMPTY_QUEUED_MESSAGE_ITEMS: readonly QueuedChatMessageItem[] = [];
+
+function equalQueuedMessageItems(
+  previous: readonly QueuedChatMessageItem[],
+  next: readonly QueuedChatMessageItem[],
+): boolean {
+  return equalArrays(previous, next, (left, right) => {
+    return left.id === right.id && left.text === right.text;
+  });
+}
+
+function useQueuedMessageItems(thread: ChatThreadSignals) {
+  const hasQueuedMessages = useLastResolved(thread.hasQueuedMessages$) ?? false;
+  const queuedMessageItems$ = hasQueuedMessages
+    ? thread.queuedMessageItems$
+    : thread.emptyQueuedMessageItems$;
+  return (
+    useLastResolved(queuedMessageItems$, {
+      equalityFn: equalQueuedMessageItems,
+    }) ?? EMPTY_QUEUED_MESSAGE_ITEMS
+  );
+}
+
+function ChatThreadComposer({ thread }: { thread: ChatThreadSignals }) {
+  const queuedMessageItems = useQueuedMessageItems(thread);
+  const hasMessagesResolved = useLastResolved(thread.hasMessages$);
+  const hasMessages = hasMessagesResolved ?? false;
+  const displayName = useLastResolved(thread.agentDisplayName$) ?? "Zero";
+  const sendButtonStatus =
+    useLastResolved(thread.composerSendButtonStatus$) ?? "sending";
+  const cancelRun = useSet(thread.cancelRun$);
+  const queueDraftSync = useSet(thread.queueDraftSync$);
+  const pageSignal = useGet(pageSignal$);
+  const {
+    computerUseHostIdForSend,
+    clearComputerUseHostOverride,
+    computerUse,
+  } = useChatThreadComputerUse(thread, pageSignal);
+
+  const { queuedItems, onRemoveQueuedItem } = useChatComposerQueue(
+    thread,
+    queuedMessageItems,
+  );
+  const { activeGoal, onCancelActiveGoal } = useChatComposerActiveGoal(
+    thread,
+    pageSignal,
+  );
+  const { modelPicker, modelPickerLoading, submitBlockerProps } =
+    useChatComposerModel(thread, pageSignal);
+  const {
+    handleSend,
+    handleQueue,
+    handleFeedbackSend,
+    submissionLoading,
+    templatePicker,
+  } = useChatThreadComposerSendState({
+    thread,
+    computerUseHostIdForSend,
+    clearComputerUseHostOverride,
+  });
+  const skeletonVisible = hasMessagesResolved === undefined;
+  const composerSending = sendButtonStatus === "sending";
+  const queueWhileSending = canQueueMessage({ sending: composerSending });
+
+  const handleDraftChange = () => {
+    detach(queueDraftSync(pageSignal), Reason.DomCallback);
+  };
+
+  const feedback = useChatThreadComposerFeedback(thread, handleFeedbackSend);
+  const workflowPrompt = useChatThreadComposerWorkflowPrompt({
+    thread,
+    pageSignal,
+  });
+  const composerOptions: ZeroChatComposerProps = {
+    composer: thread.workflowComposer,
+    onSend: handleSend,
+    onQueue: handleQueue,
+    sending: composerSending,
+    queueWhileSending,
+    submissionLoading,
+    onCancel: composerSending
+      ? () => {
+          detach(cancelRun(pageSignal), Reason.DomCallback);
+        }
+      : undefined,
+    displayName,
+    className: "w-full min-w-0",
+    autoFocus: shouldAutoFocusComposer({
+      autoFocus: true,
+      hasMessages,
+    }),
+    enableMobileSingleLine: true,
+    onDraftChange: handleDraftChange,
+    draft: thread.draft,
+    composerFileInput$: thread.composerFileInput$,
+    setComposerFileInput$: thread.setComposerFileInput$,
+    chatThreadId: thread.threadId,
+    actionsLoading: skeletonVisible,
+    modelPicker,
+    templatePicker,
+    onCreateWorkflowPrompt: workflowPrompt.onCreateWorkflowPrompt,
+    computerUse,
+    modelPickerLoading,
+    submitBlocker: submitBlockerProps,
+    queuedItems,
+    onRemoveQueuedItem,
+    activeGoal,
+    onCancelActiveGoal,
+    feedback,
+  };
+  const composer = useZeroChatComposer(composerOptions);
+
+  return (
+    <footer
+      data-chat-composer
+      className="relative shrink-0 bg-[hsl(var(--background))] pb-2"
+    >
+      <div className="pointer-events-none absolute inset-x-0 -top-5 h-[21px] bg-gradient-to-t from-[hsl(var(--background))] to-transparent" />
+      <div className="overflow-y-auto [scrollbar-gutter:stable] pb-2 pl-4 pr-4 pt-3 sm:pl-6 sm:pr-6">
+        <div className="mx-auto max-w-[900px]">
+          {composer}
+          <ReplaceComposerDraftDialog
+            open={workflowPrompt.replaceDraftDialogOpen}
+            onOpenChange={workflowPrompt.onReplaceDialogOpenChange}
+            onConfirm={workflowPrompt.onConfirmReplaceDraft}
+          />
+          <PersonalClaudeCodeDeviceAuthDialog />
+          <PersonalCodexDeviceAuthDialog />
+        </div>
+      </div>
+    </footer>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Skeleton placeholder while session loads
+// ---------------------------------------------------------------------------
+
+function ChatSkeleton() {
+  return (
+    <>
+      {/* User bubble skeleton */}
+      <div className="flex justify-end">
+        <Skeleton className="h-10 w-[60%] rounded-xl" />
+      </div>
+      {/* Assistant bubble skeleton */}
+      <div className="flex flex-col gap-2 @[900px]:grid @[900px]:grid-cols-[36px_minmax(0,1fr)] @[900px]:gap-2.5 @[900px]:-ml-[46px] @[900px]:items-start">
+        <Skeleton className="h-7 w-7 @[900px]:h-9 @[900px]:w-9 shrink-0 @[900px]:mt-0.5 rounded-xl" />
+        <div className="flex flex-col gap-2">
+          <Skeleton className="h-4 w-[90%] rounded-lg" />
+          <Skeleton className="h-4 w-[75%] rounded-lg" />
+          <Skeleton className="h-4 w-[40%] rounded-lg" />
+        </div>
+      </div>
+      {/* User bubble skeleton */}
+      <div className="flex justify-end">
+        <Skeleton className="h-10 w-[45%] rounded-xl" />
+      </div>
+      {/* Assistant bubble skeleton */}
+      <div className="flex flex-col gap-2 @[900px]:grid @[900px]:grid-cols-[36px_minmax(0,1fr)] @[900px]:gap-2.5 @[900px]:-ml-[46px] @[900px]:items-start">
+        <Skeleton className="h-7 w-7 @[900px]:h-9 @[900px]:w-9 shrink-0 @[900px]:mt-0.5 rounded-xl" />
+        <div className="flex flex-col gap-2">
+          <Skeleton className="h-4 w-[85%] rounded-lg" />
+          <Skeleton className="h-4 w-[60%] rounded-lg" />
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Thinking indicator — shown the entire time a run is active
+// ---------------------------------------------------------------------------
+
+interface ServerThinkingLabel {
+  readonly displayedText: string;
+  readonly fullText: string;
+  readonly id: string;
+  readonly setRef: (
+    el: HTMLParagraphElement | null,
+  ) => (() => void) | undefined;
+}
+
+function ThinkingLabel({
+  isQueued,
+  thinkingLabel,
+  serverThinkingLabel,
+}: {
+  isQueued: boolean;
+  thinkingLabel: string;
+  serverThinkingLabel?: ServerThinkingLabel;
+}) {
+  const openQueueDrawer = useSet(openQueueDrawer$);
+  const pageSignal = useGet(pageSignal$);
+
+  if (isQueued) {
+    return (
+      <p className="zero-shimmer-text min-w-0 flex-1 text-[0.8125rem] truncate">
+        Waiting in{" "}
+        <button
+          type="button"
+          onClick={() => {
+            openQueueDrawer(pageSignal);
+          }}
+          className="cursor-pointer underline underline-offset-2"
+        >
+          queue...
+        </button>
+      </p>
+    );
+  }
+
+  if (serverThinkingLabel) {
+    return (
+      <p
+        key={serverThinkingLabel.id}
+        ref={serverThinkingLabel.setRef}
+        className="zero-shimmer-text min-w-0 flex-1 overflow-hidden whitespace-nowrap text-[0.8125rem]"
+        aria-label={serverThinkingLabel.fullText}
+      >
+        {serverThinkingLabel.displayedText || "\u00a0"}
+      </p>
+    );
+  }
+
+  return (
+    <p className="zero-shimmer-text min-w-0 flex-1 text-[0.8125rem] truncate">
+      {thinkingLabel}
+    </p>
+  );
+}
+
+function InlineThinkingRow({
+  blockStyle,
+  isQueued,
+  thinkingLabel,
+  serverThinkingLabel,
+}: {
+  blockStyle: CSSProperties;
+  isQueued: boolean;
+  thinkingLabel: string;
+  serverThinkingLabel?: ServerThinkingLabel;
+}) {
+  return (
+    <div className="flex items-center gap-2 h-5">
+      <span className="zero-blocks shrink-0" style={blockStyle}>
+        <span />
+        <span />
+        <span />
+      </span>
+      <ThinkingLabel
+        isQueued={isQueued}
+        thinkingLabel={thinkingLabel}
+        serverThinkingLabel={serverThinkingLabel}
+      />
+    </div>
+  );
+}
+
+function FinishedRunRow({
+  thread,
+  source,
+}: {
+  thread: ChatThreadSignals;
+  source: RecommendedFollowupSource | null;
+}) {
+  const donePhrase = useLastResolved(thread.donePhrase$) ?? "Done";
+  const label = source ? "Keep going" : donePhrase;
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex h-5 flex-col justify-center gap-1.5">
+        <div className="h-px w-full bg-border/40" />
+        <div className="flex items-center gap-2">
+          <p className={RUN_SECTION_LABEL_CLASS}>{label}</p>
+          <div className="h-px flex-1 bg-border/40" />
+        </div>
+      </div>
+      {source ? (
+        <RecommendedFollowupList thread={thread} source={source} />
+      ) : null}
+    </div>
+  );
+}
+
+function WaitingForAssistantResponse({
+  thread,
+  blockStyle,
+  isQueued,
+  thinkingLabel,
+  serverThinkingLabel,
+}: {
+  thread: ChatThreadSignals;
+  blockStyle: CSSProperties;
+  isQueued: boolean;
+  thinkingLabel: string;
+  serverThinkingLabel?: ServerThinkingLabel;
+}) {
+  return (
+    <div
+      data-thinking-indicator
+      data-role="assistant"
+      className="zero-thinking-enter flex flex-col gap-1"
+    >
+      <div className="flex flex-col gap-2 @[900px]:grid @[900px]:grid-cols-[36px_minmax(0,1fr)] @[900px]:gap-2.5 @[900px]:-ml-[46px] @[900px]:items-start">
+        <AssistantBubbleAvatar thread={thread} />
+        <div className="zero-chat-bubble-assistant rounded-xl py-4 text-[0.9375rem] leading-[1.7] min-w-0 overflow-hidden">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="zero-blocks shrink-0" style={blockStyle}>
+              <span />
+              <span />
+              <span />
+            </span>
+            <ThinkingLabel
+              isQueued={isQueued}
+              thinkingLabel={thinkingLabel}
+              serverThinkingLabel={serverThinkingLabel}
+            />
+          </div>
+        </div>
+      </div>
+      <div
+        aria-hidden
+        className="@[900px]:grid @[900px]:grid-cols-[36px_minmax(0,1fr)] @[900px]:gap-2.5 @[900px]:-ml-[46px]"
+      >
+        <div className="hidden @[900px]:block" />
+        <div className="flex items-center py-2 gap-1 -ml-1" />
+      </div>
+    </div>
+  );
+}
+
+function AssistantThinkingStatusRow({
+  running,
+  blockStyle,
+  isQueued,
+  thinkingLabel,
+  serverThinkingLabel,
+  thread,
+  recommendedFollowupSource,
+}: {
+  running: boolean;
+  blockStyle: CSSProperties;
+  isQueued: boolean;
+  thinkingLabel: string;
+  serverThinkingLabel?: ServerThinkingLabel;
+  thread: ChatThreadSignals;
+  recommendedFollowupSource: RecommendedFollowupSource | null;
+}) {
+  const thinkingIndicatorProps = running
+    ? { "data-thinking-indicator": true }
+    : {};
+
+  return (
+    <div
+      {...thinkingIndicatorProps}
+      data-role="assistant-thinking"
+      className="-mt-5 @[900px]:grid @[900px]:grid-cols-[36px_1fr] @[900px]:gap-2.5 @[900px]:-ml-[46px] @[900px]:items-start"
+    >
+      <div className="hidden @[900px]:block" />
+      <div className="min-w-0">
+        {running ? (
+          <InlineThinkingRow
+            blockStyle={blockStyle}
+            isQueued={isQueued}
+            thinkingLabel={thinkingLabel}
+            serverThinkingLabel={serverThinkingLabel}
+          />
+        ) : (
+          <FinishedRunRow thread={thread} source={recommendedFollowupSource} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function thinkingIndicatorRunning(mode: ThinkingIndicatorMode): boolean {
+  return mode !== null && mode !== "finished";
+}
+
+function thinkingIndicatorQueued(mode: ThinkingIndicatorMode): boolean {
+  return mode === "waiting-queued" || mode === "running-queued";
+}
+
+function thinkingIndicatorUsesStatusRow(mode: ThinkingIndicatorMode): boolean {
+  return mode === "running" || mode === "running-queued" || mode === "finished";
+}
+
+function equalRecommendedFollowupSources(
+  previous: RecommendedFollowupSource | null,
+  next: RecommendedFollowupSource | null,
+): boolean {
+  return (
+    previous === next ||
+    (previous !== null &&
+      next !== null &&
+      previous.messageId === next.messageId &&
+      previous.followups === next.followups)
+  );
+}
+
+function ThinkingIndicator({ thread }: { thread: ChatThreadSignals }) {
+  const [c1, c2, c3] = useGet(thread.blockColors$);
+  const blockStyle = {
+    "--zb-c1": c1,
+    "--zb-c2": c2,
+    "--zb-c3": c3,
+  } as CSSProperties;
+  const mode = useLastResolved(thread.thinkingIndicatorMode$) ?? null;
+  const thinkingText = useLastResolved(thread.thinkingText$);
+  const recommendedFollowupSource =
+    useLastResolved(thread.recommendedFollowupSource$, {
+      equalityFn: equalRecommendedFollowupSources,
+    }) ?? null;
+  const thinkingLabel = useGet(thread.thinkingPhrase$);
+  const running = thinkingIndicatorRunning(mode);
+  const isQueued = thinkingIndicatorQueued(mode);
+  const thinkingMessageId = useLastResolved(thread.thinkingMessageId$);
+  const displayedThinkingText =
+    useLastResolved(thread.displayedThinkingText$) ?? "";
+  const setThinkingIndicatorTextRef = useSet(
+    thread.setThinkingIndicatorTextRef$,
+  );
+  const serverThinkingLabel =
+    thinkingText && thinkingMessageId && running
+      ? {
+          displayedText: displayedThinkingText,
+          fullText: thinkingText,
+          id: thinkingMessageId,
+          setRef: setThinkingIndicatorTextRef,
+        }
+      : undefined;
+
+  if (mode === null) {
+    return null;
+  }
+
+  // Shared inline row with fixed h-5 to prevent layout jump on transition
+  if (thinkingIndicatorUsesStatusRow(mode)) {
+    return (
+      <AssistantThinkingStatusRow
+        running={running}
+        blockStyle={blockStyle}
+        isQueued={isQueued}
+        thinkingLabel={thinkingLabel}
+        serverThinkingLabel={serverThinkingLabel}
+        thread={thread}
+        recommendedFollowupSource={recommendedFollowupSource}
+      />
+    );
+  }
+
+  // Waiting for first assistant response — show bubble with avatar
+  return (
+    <WaitingForAssistantResponse
+      thread={thread}
+      blockStyle={blockStyle}
+      isQueued={isQueued}
+      thinkingLabel={thinkingLabel}
+      serverThinkingLabel={serverThinkingLabel}
+    />
+  );
+}
+
+/**
+ * Parse inline attachment lines from message content.
+ * Matches `[Attached file: name](url)` optionally followed by a curl line.
+ * Returns the cleaned content and parsed attachments.
+ */
+function parseInlineAttachments(content: string): {
+  cleanContent: string;
+  parsed: { filename: string; url: string }[];
+} {
+  const parsed: { filename: string; url: string }[] = [];
+  const cleaned = content.replace(
+    /\[Attached file: ([^\]]+)\]\(([^)]+)\)(?:\nDownload with: curl [^\n]*)?\n?/g,
+    (_match, filename: string, url: string) => {
+      parsed.push({ filename, url });
+      return "";
+    },
+  );
+  return { cleanContent: cleaned.trim(), parsed };
+}
+
+function BodyContentBlocks({
+  blocks,
+  openLightbox,
+  hardBreaks,
+  escapeMarkdownHtml = false,
+  markdownMediaPreview = true,
+}: {
+  blocks: BodyRenderBlock[];
+  openLightbox: (url: string) => void;
+  hardBreaks: boolean;
+  escapeMarkdownHtml?: boolean;
+  markdownMediaPreview?: boolean;
+}) {
+  const openVideoLightbox = useSet(openAttachmentVideoLightbox$);
+
+  return (
+    <div className="flex flex-col gap-3">
+      {blocks.map((block) => {
+        if (block.type === "markdown") {
+          return (
+            <Markdown
+              key={block.id}
+              source={
+                hardBreaks
+                  ? block.content.replace(/\n/g, "  \n")
+                  : block.content
+              }
+              mediaPreview={markdownMediaPreview}
+              mathEnabled
+              escapeHtml={escapeMarkdownHtml}
+              style={{ fontSize: "inherit", lineHeight: "inherit" }}
+            />
+          );
+        }
+
+        if (block.type === "connector-action") {
+          return <ConnectorActionCard key={block.id} block={block} />;
+        }
+
+        if (block.type === "custom-connector-action") {
+          return <CustomConnectorActionCard key={block.id} block={block} />;
+        }
+
+        if (block.type === "permission-action") {
+          return <PermissionActionCard key={block.id} block={block} />;
+        }
+
+        if (block.type === "computer-use-authorization") {
+          return <ComputerUseAuthorizationCard key={block.id} block={block} />;
+        }
+
+        if (block.preview.kind === "image") {
+          return (
+            <ChatImagePreviewLink
+              key={block.id}
+              alt={block.preview.filename}
+              ariaLabel={`Preview ${block.preview.filename}`}
+              imageClassName="block h-full w-full object-contain"
+              linkClassName={CHAT_INLINE_IMAGE_PREVIEW_CLASS}
+              onPreview={() => {
+                openLightbox(block.preview.url);
+              }}
+              placeholderClassName="h-full w-full"
+              url={block.preview.url}
+            />
+          );
+        }
+
+        if (block.preview.kind === "video") {
+          return (
+            <ChatVideoPreviewButton
+              key={block.id}
+              ariaLabel={`Preview ${block.preview.filename}`}
+              buttonClassName={CHAT_INLINE_VIDEO_BODY_PREVIEW_CLASS}
+              filename={block.preview.filename}
+              onPreview={() => {
+                openVideoLightbox({
+                  url: block.preview.url,
+                  filename: block.preview.filename,
+                });
+              }}
+              posterClassName="h-full w-full"
+              url={block.preview.url}
+              videoClassName="h-full w-full object-contain"
+            />
+          );
+        }
+
+        return (
+          <AttachmentPreview
+            key={block.id}
+            attachment={{
+              filename: block.preview.filename,
+              url: block.preview.url,
+              contentType: contentTypeForBodyPreviewKind(block.preview.kind),
+            }}
+            text$={block.preview.text$}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+function ConnectorActionCard({ block }: { block: ConnectorActionBlock }) {
+  const pageSignal = useGet(pageSignal$);
+  const available = useLastResolved(block.available$) ?? false;
+  const complete = useLastResolved(block.complete$) ?? false;
+  const displayMetadata = useLastResolved(block.displayMetadata$);
+  const [activateLoadable, activate] = useLoadableSet(block.activate$);
+  const activating = activateLoadable.state === "loading";
+  if (!available || !displayMetadata) {
+    return null;
+  }
+
+  return (
+    <div
+      data-testid="connector-action-card"
+      className="flex min-h-[88px] w-full flex-col gap-3 rounded-lg border border-border/70 bg-background/85 p-3 text-left shadow-sm sm:flex-row sm:items-center sm:justify-between"
+    >
+      <div className="flex min-w-0 items-center gap-3">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-muted/40">
+          <ConnectorIcon icon={displayMetadata.icon} size={22} />
+        </div>
+        <div className="min-w-0">
+          <div className="truncate text-[0.9375rem] font-medium text-foreground">
+            {displayMetadata.label}
+          </div>
+          <div className="mt-0.5 line-clamp-2 text-sm leading-5 text-muted-foreground">
+            {displayMetadata.helpText}
+          </div>
+        </div>
+      </div>
+      <button
+        type="button"
+        disabled={complete || activating}
+        onClick={() => {
+          detach(activate(pageSignal), Reason.DomCallback);
+        }}
+        className="inline-flex h-9 w-full shrink-0 items-center justify-center gap-2 rounded-lg border border-border bg-background px-3 text-[0.9375rem] font-medium text-foreground transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto"
+      >
+        {activating && <IconLoader2 size={15} className="animate-spin" />}
+        {complete ? "Connected" : "Connect"}
+      </button>
+    </div>
+  );
+}
+
+function CustomConnectorActionCard({
+  block,
+}: {
+  block: CustomConnectorActionBlock;
+}) {
+  return (
+    <div
+      data-testid="custom-connector-action-card"
+      className="flex min-h-[88px] w-full flex-col gap-3 rounded-lg border border-border/70 bg-background/85 p-3 text-left shadow-sm sm:flex-row sm:items-center sm:justify-between"
+    >
+      <div className="flex min-w-0 items-center gap-3">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-muted/40">
+          <IconPackage size={22} />
+        </div>
+        <div className="min-w-0">
+          <div className="truncate text-[0.9375rem] font-medium text-foreground">
+            {block.displayName}
+          </div>
+          <div className="mt-0.5 line-clamp-2 text-sm leading-5 text-muted-foreground">
+            {block.agentId
+              ? "Review, connect, and authorize this custom connector for the agent."
+              : "Review and connect this custom connector."}
+          </div>
+        </div>
+      </div>
+      <a
+        href={block.originalUrl}
+        target="_blank"
+        rel="noreferrer"
+        className="inline-flex h-9 w-full shrink-0 items-center justify-center gap-2 rounded-lg border border-border bg-background px-3 text-[0.9375rem] font-medium text-foreground transition-colors hover:bg-accent sm:w-auto"
+      >
+        Configure
+        <IconArrowUpRight size={15} />
+      </a>
+    </div>
+  );
+}
+
+function ComputerUseAuthorizationCard({
+  block,
+}: {
+  block: ComputerUseAuthorizationBlock;
+}) {
+  return (
+    <div
+      data-testid="computer-use-authorization-card"
+      className="flex min-h-[88px] w-full flex-col gap-3 rounded-lg border border-border/70 bg-background/85 p-3 text-left shadow-sm sm:flex-row sm:items-center sm:justify-between"
+    >
+      <div className="flex min-w-0 items-center gap-3">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-muted/40">
+          <IconDeviceDesktop size={22} />
+        </div>
+        <div className="min-w-0">
+          <div className="truncate text-[0.9375rem] font-medium text-foreground">
+            Computer Use authorization
+          </div>
+          <div className="mt-0.5 line-clamp-2 text-sm leading-5 text-muted-foreground">
+            Select a Desktop host for future runs in this thread.
+          </div>
+        </div>
+      </div>
+      <a
+        href={block.href}
+        target="_blank"
+        rel="noreferrer"
+        className="inline-flex h-9 w-full shrink-0 items-center justify-center gap-2 rounded-lg border border-border bg-background px-3 text-[0.9375rem] font-medium text-foreground transition-colors hover:bg-accent sm:w-auto"
+      >
+        Authorize
+        <IconArrowUpRight size={15} />
+      </a>
+    </div>
+  );
+}
+
+type PermissionAction = "allow" | "deny";
+
+type PermissionActionUserGrant = UserPermissionGrantResponse;
+
+type PermissionActionCardStatus =
+  | { kind: "loading" }
+  | { kind: "load-error" }
+  | { kind: "save-error" }
+  | { kind: "ready" }
+  | { kind: "saving" }
+  | { kind: "saved" }
+  | { kind: "already-applied" }
+  | { kind: "missing-target" }
+  | { kind: "missing-permission" };
+
+interface LoadableLike<T> {
+  state: string;
+  data?: T;
+}
+
+type ApplyUserPermissionGrantFn = (
+  params: {
+    agentId?: string;
+    workflowId?: string;
+    connectorRef: string;
+    permission: string;
+    action: PermissionAction;
+    expiresIn?: UserPermissionGrantExpiresIn;
+  },
+  signal: AbortSignal,
+) => Promise<UserPermissionGrantResponse>;
+
+function loadableData<T>(loadable: LoadableLike<T>): T | undefined {
+  return loadable.state === "hasData" ? loadable.data : undefined;
+}
+
+function permissionActionVerb(action: PermissionAction): string {
+  return action === "allow" ? "Allow" : "Deny";
+}
+
+function permissionActionStatusText(
+  status: PermissionActionCardStatus,
+  action: "allow" | "deny",
+): { label: string; className: string } | null {
+  if (status.kind === "saved") {
+    return action === "allow"
+      ? { label: "Permissions updated", className: "text-green-600" }
+      : { label: "Permission denied", className: "text-destructive" };
+  }
+  if (status.kind === "already-applied") {
+    return action === "allow"
+      ? { label: "Already allowed", className: "text-green-600" }
+      : { label: "Already denied", className: "text-destructive" };
+  }
+  return null;
+}
+
+function PermissionActionButton({
+  status,
+  onClick,
+}: {
+  status: PermissionActionCardStatus;
+  onClick: () => void;
+}) {
+  if (
+    status.kind !== "ready" &&
+    status.kind !== "saving" &&
+    status.kind !== "save-error"
+  ) {
+    return null;
+  }
+
+  const saving = status.kind === "saving";
+  return (
+    <button
+      type="button"
+      disabled={saving}
+      onClick={onClick}
+      className="inline-flex h-9 w-full shrink-0 items-center justify-center gap-2 rounded-lg border border-border bg-background px-3 text-[0.9375rem] font-medium text-foreground transition-colors hover:bg-accent sm:w-auto"
+    >
+      {saving && <IconLoader2 size={15} className="animate-spin" />}
+      {saving ? "Saving..." : "Confirm"}
+    </button>
+  );
+}
+
+function PermissionActionTerminalStatus({
+  status,
+  action,
+}: {
+  status: PermissionActionCardStatus;
+  action: "allow" | "deny";
+}) {
+  const text = permissionActionStatusText(status, action);
+  if (!text) {
+    return null;
+  }
+  return (
+    <span className={`shrink-0 text-[0.9375rem] font-medium ${text.className}`}>
+      {text.label}
+    </span>
+  );
+}
+
+function PermissionActionInlineStatus({
+  status,
+}: {
+  status: PermissionActionCardStatus;
+}) {
+  switch (status.kind) {
+    case "loading": {
+      return (
+        <div className="mt-1 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+          <IconLoader2 size={13} className="animate-spin" />
+          <span>Checking permission status...</span>
+        </div>
+      );
+    }
+    case "load-error": {
+      return (
+        <div className="mt-1 flex items-center gap-1.5 text-xs font-medium text-destructive">
+          <IconAlertCircle size={13} />
+          <span>Couldn&apos;t load permission status</span>
+        </div>
+      );
+    }
+    case "save-error": {
+      return (
+        <div className="mt-1 flex items-center gap-1.5 text-xs font-medium text-destructive">
+          <IconAlertCircle size={13} />
+          <span>Couldn&apos;t update permissions</span>
+        </div>
+      );
+    }
+    case "missing-target": {
+      return (
+        <div className="mt-1 flex items-center gap-1.5 text-xs font-medium text-destructive">
+          <IconAlertCircle size={13} />
+          <span>Agent not found</span>
+        </div>
+      );
+    }
+    case "missing-permission": {
+      return (
+        <div className="mt-1 flex items-center gap-1.5 text-xs font-medium text-destructive">
+          <IconAlertCircle size={13} />
+          <span>Unknown permission</span>
+        </div>
+      );
+    }
+    case "ready":
+    case "saving":
+    case "saved":
+    case "already-applied": {
+      return null;
+    }
+  }
+}
+
+function isPermissionActionLoading(params: {
+  agentLoading: boolean;
+  permissionMetadataLoading: boolean;
+  userGrantsLoading: boolean;
+}): boolean {
+  return (
+    params.agentLoading ||
+    params.permissionMetadataLoading ||
+    params.userGrantsLoading
+  );
+}
+
+function isPermissionActionSaving(params: { grantLoading: boolean }): boolean {
+  return params.grantLoading;
+}
+
+function isPermissionActionLoadError(params: {
+  agentError: boolean;
+  permissionMetadataError: boolean;
+  userGrantsError: boolean;
+}): boolean {
+  return (
+    params.agentError ||
+    params.permissionMetadataError ||
+    params.userGrantsError
+  );
+}
+
+function isPermissionActionAlreadyApplied(params: {
+  hasAgent: boolean;
+  userGrantPolicy: FirewallPolicyValue | undefined;
+  action: "allow" | "deny";
+}): boolean {
+  if (!params.hasAgent) {
+    return false;
+  }
+  return params.userGrantPolicy === params.action;
+}
+
+function findPermissionActionPermission(
+  block: PermissionActionBlock,
+  metadata: PublicConnectorCatalogPermissionDetail | undefined,
+) {
+  return metadata
+    ? (findPermissionInMetadata(metadata, block.permission) ?? undefined)
+    : undefined;
+}
+
+function permissionActionUserGrantPolicy(
+  loadable: LoadableLike<readonly PermissionActionUserGrant[]>,
+  block: PermissionActionBlock,
+  metadata: PublicConnectorCatalogPermissionDetail | undefined,
+): FirewallPolicyValue | undefined {
+  const grants = loadableData(loadable);
+  if (!grants || !metadata) {
+    return undefined;
+  }
+  return resolveUserPermissionGrantPolicy(grants, metadata, block.permission);
+}
+
+function permissionActionUserGrant(
+  loadable: LoadableLike<readonly PermissionActionUserGrant[]>,
+  block: PermissionActionBlock,
+): PermissionActionUserGrant | undefined {
+  const grants = loadableData(loadable);
+  if (!grants) {
+    return undefined;
+  }
+  return grants.find((grant) => {
+    return (
+      grant.connectorRef === block.connectorRef &&
+      grant.permission === block.permission &&
+      grant.action === block.action
+    );
+  });
+}
+
+function permissionActionGrantExpiresAt({
+  savedGrant,
+  savedGrantActive,
+  existingGrant,
+  existingGrantActive,
+  status,
+}: {
+  savedGrant: PermissionActionUserGrant | null;
+  savedGrantActive: boolean;
+  existingGrant: PermissionActionUserGrant | undefined;
+  existingGrantActive: boolean;
+  status: PermissionActionCardStatus;
+}): string | null {
+  if (savedGrantActive) {
+    return savedGrant?.expiresAt ?? null;
+  }
+  if (existingGrantActive) {
+    return existingGrant?.expiresAt ?? null;
+  }
+  if (status.kind !== "ready") {
+    return null;
+  }
+  return savedGrant?.expiresAt ?? existingGrant?.expiresAt ?? null;
+}
+
+function createPermissionActionCardStatus(params: {
+  hasAgent: boolean;
+  hasPermission: boolean;
+  loading: boolean;
+  loadError: boolean;
+  saving: boolean;
+  saveDone: boolean;
+  saveError: boolean;
+  alreadyApplied: boolean;
+}): PermissionActionCardStatus {
+  if (params.saving) {
+    return { kind: "saving" };
+  }
+  if (params.saveDone) {
+    return { kind: "saved" };
+  }
+  if (params.loading) {
+    return { kind: "loading" };
+  }
+  if (params.loadError) {
+    return { kind: "load-error" };
+  }
+  if (!params.hasAgent) {
+    return { kind: "missing-target" };
+  }
+  if (!params.hasPermission) {
+    return { kind: "missing-permission" };
+  }
+  if (params.alreadyApplied) {
+    return { kind: "already-applied" };
+  }
+  if (params.saveError) {
+    return { kind: "save-error" };
+  }
+  return { kind: "ready" };
+}
+
+function createPermissionActionCardViewState(params: {
+  block: PermissionActionBlock;
+  hasAgent: boolean;
+  agentLoadableState: string;
+  permissionMetadataLoadable: LoadableLike<PublicConnectorCatalogPermissionDetail | null>;
+  userGrantsLoadable: LoadableLike<readonly PermissionActionUserGrant[]>;
+  grantLoadableState: string;
+  savedGrantActive: boolean;
+}) {
+  const permissionMetadata =
+    params.permissionMetadataLoadable.state === "hasData"
+      ? (params.permissionMetadataLoadable.data ?? undefined)
+      : undefined;
+  const focusedPermission = findPermissionActionPermission(
+    params.block,
+    permissionMetadata,
+  );
+  const actionLabel = permissionActionVerb(params.block.action);
+  const loading = isPermissionActionLoading({
+    agentLoading: params.agentLoadableState === "loading",
+    permissionMetadataLoading:
+      params.permissionMetadataLoadable.state === "loading",
+    userGrantsLoading: params.userGrantsLoadable.state === "loading",
+  });
+  const loadError = isPermissionActionLoadError({
+    agentError: params.agentLoadableState === "hasError",
+    permissionMetadataError:
+      params.permissionMetadataLoadable.state === "hasError",
+    userGrantsError: params.userGrantsLoadable.state === "hasError",
+  });
+  const saving = isPermissionActionSaving({
+    grantLoading: params.grantLoadableState === "loading",
+  });
+  const saveError = params.grantLoadableState === "hasError";
+  const userGrantPolicy = permissionActionUserGrantPolicy(
+    params.userGrantsLoadable,
+    params.block,
+    permissionMetadata,
+  );
+  const alreadyApplied = isPermissionActionAlreadyApplied({
+    hasAgent: params.hasAgent,
+    userGrantPolicy,
+    action: params.block.action,
+  });
+  const saveDone =
+    params.grantLoadableState === "hasData" && params.savedGrantActive;
+  const status = createPermissionActionCardStatus({
+    hasAgent: params.hasAgent,
+    hasPermission: Boolean(focusedPermission),
+    loading,
+    loadError,
+    saving,
+    saveDone,
+    saveError,
+    alreadyApplied,
+  });
+  return {
+    actionLabel,
+    status,
+    focusedPermission,
+  };
+}
+
+function runPermissionAction(params: {
+  status: PermissionActionCardStatus;
+  runUserGrant: () => void;
+}): void {
+  if (params.status.kind !== "ready" && params.status.kind !== "save-error") {
+    return;
+  }
+
+  params.runUserGrant();
+}
+
+function createPermissionActionHandler(params: {
+  block: PermissionActionBlock;
+  pageSignal: AbortSignal;
+  focusedPermission: { name: string } | undefined;
+  status: PermissionActionCardStatus;
+  expirationAvailable: boolean;
+  expiresIn: UserPermissionGrantExpiresIn;
+  applyGrant: ApplyUserPermissionGrantFn;
+}): () => void {
+  return () => {
+    const permissionName =
+      params.focusedPermission?.name ?? params.block.permission;
+    runPermissionAction({
+      status: params.status,
+      runUserGrant: () => {
+        detach(
+          params.applyGrant(
+            {
+              agentId: params.block.agentId,
+              connectorRef: params.block.connectorRef,
+              permission: permissionName,
+              action: params.block.action,
+              ...(params.expirationAvailable
+                ? { expiresIn: params.expiresIn }
+                : {}),
+            },
+            params.pageSignal,
+          ),
+          Reason.DomCallback,
+        );
+      },
+    });
+  };
+}
+
+function PermissionActionCardContent({
+  block,
+  icon,
+  connectorLabel,
+  actionLabel,
+  permissionName,
+  status,
+  expirationAvailable,
+  expiresIn,
+  onExpiresInChange,
+  expiresAt,
+  onClick,
+}: {
+  block: PermissionActionBlock;
+  icon: PublicConnectorCatalogPermissionDetail["icon"] | undefined;
+  connectorLabel: string;
+  actionLabel: string;
+  permissionName: string;
+  status: PermissionActionCardStatus;
+  expirationAvailable: boolean;
+  expiresIn: UserPermissionGrantExpiresIn;
+  onExpiresInChange: (value: UserPermissionGrantExpiresIn) => void;
+  expiresAt: string | null;
+  onClick: () => void;
+}) {
+  const expiryText = expirationAvailable
+    ? permissionGrantExpiryText(expiresAt)
+    : null;
+  const showDurationSelect =
+    expirationAvailable &&
+    (status.kind === "ready" ||
+      status.kind === "saving" ||
+      status.kind === "save-error");
+  return (
+    <div
+      data-testid="permission-action-card"
+      className="flex min-h-[88px] w-full flex-col gap-3 rounded-lg border border-border/70 bg-background/85 p-3 text-left shadow-sm sm:flex-row sm:items-center sm:justify-between"
+    >
+      <div className="flex min-w-0 items-center gap-3">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-muted/40">
+          <ConnectorIcon icon={icon} size={22} />
+        </div>
+        <div className="min-w-0">
+          <div className="truncate text-[0.9375rem] font-medium text-foreground">
+            {connectorLabel} permissions
+          </div>
+          <div className="mt-0.5 line-clamp-2 text-sm leading-5 text-muted-foreground">
+            {actionLabel} {permissionName}
+          </div>
+          <PermissionActionInlineStatus status={status} />
+          {expiryText && (
+            <div className="mt-0.5 text-xs font-medium text-amber-700 dark:text-amber-400">
+              {expiryText}
+            </div>
+          )}
+        </div>
+      </div>
+      <div className="flex w-full shrink-0 flex-col gap-2 sm:w-auto sm:flex-row sm:items-center">
+        {showDurationSelect && (
+          <PermissionGrantDurationSelect
+            value={expiresIn}
+            onValueChange={onExpiresInChange}
+            disabled={status.kind === "saving"}
+            ariaLabel="Permission duration"
+          />
+        )}
+        <PermissionActionTerminalStatus status={status} action={block.action} />
+        <PermissionActionButton status={status} onClick={onClick} />
+      </div>
+    </div>
+  );
+}
+
+function PermissionActionCardForTarget({
+  block,
+  hasTarget,
+  targetLoadableState,
+  userGrantsLoadable,
+}: {
+  block: PermissionActionBlock;
+  hasTarget: boolean;
+  targetLoadableState: string;
+  userGrantsLoadable: LoadableLike<readonly PermissionActionUserGrant[]>;
+}) {
+  const pageSignal = useGet(pageSignal$);
+  const expirationAvailable = block.action === "allow";
+  const durationScope = `${block.id}\u0000${block.expiresIn ?? ""}`;
+  const expiresInByScope = useGet(permissionGrantExpiresInByScope$);
+  const setExpiresInForScope = useSet(setPermissionGrantExpiresIn$);
+  const expiresIn =
+    expiresInByScope[durationScope] ??
+    block.expiresIn ??
+    DEFAULT_USER_PERMISSION_GRANT_EXPIRES_IN;
+  const permissionMetadataLoadable = useLoadable(
+    firewallPermissionMetadataByConnector({
+      connectorRef: block.connectorRef,
+    }),
+  );
+  const [grantLoadable, applyGrant] = useLoadableSet(applyUserPermissionGrant$);
+  const savedGrant =
+    grantLoadable.state === "hasData" ? grantLoadable.data : null;
+  const savedGrantActive = savedGrant
+    ? isActiveUserPermissionGrant(savedGrant)
+    : false;
+  const rawUserGrants = loadableData(userGrantsLoadable) ?? [];
+  useUserPermissionGrantExpiryTick(
+    savedGrant ? [...rawUserGrants, savedGrant] : rawUserGrants,
+  );
+  const existingGrant = permissionActionUserGrant(userGrantsLoadable, block);
+  const existingGrantActive = existingGrant
+    ? isActiveUserPermissionGrant(existingGrant)
+    : false;
+  const actionState = createPermissionActionCardViewState({
+    block,
+    hasAgent: hasTarget,
+    agentLoadableState: targetLoadableState,
+    permissionMetadataLoadable,
+    userGrantsLoadable,
+    grantLoadableState: grantLoadable.state,
+    savedGrantActive,
+  });
+  const permissionMetadata =
+    permissionMetadataLoadable.state === "hasData"
+      ? permissionMetadataLoadable.data
+      : null;
+  const grantExpiresAt = permissionActionGrantExpiresAt({
+    savedGrant,
+    savedGrantActive,
+    existingGrant,
+    existingGrantActive,
+    status: actionState.status,
+  });
+
+  return (
+    <PermissionActionCardContent
+      block={block}
+      icon={permissionMetadata?.icon}
+      connectorLabel={permissionMetadata?.label ?? block.connectorRef}
+      actionLabel={actionState.actionLabel}
+      permissionName={actionState.focusedPermission?.name ?? block.permission}
+      status={actionState.status}
+      expirationAvailable={expirationAvailable}
+      expiresIn={expiresIn}
+      onExpiresInChange={(value) => {
+        setExpiresInForScope(durationScope, value);
+      }}
+      expiresAt={grantExpiresAt}
+      onClick={createPermissionActionHandler({
+        block,
+        pageSignal,
+        focusedPermission: actionState.focusedPermission,
+        status: actionState.status,
+        expirationAvailable,
+        expiresIn,
+        applyGrant,
+      })}
+    />
+  );
+}
+
+function AgentPermissionActionCard({
+  block,
+}: {
+  block: PermissionActionBlock;
+}) {
+  const agentLoadable = useLastLoadable(agentById(block.agentId));
+  const userGrantsLoadable = useLoadable(
+    userPermissionGrantsByAgent({
+      agentId: block.agentId,
+    }),
+  );
+  const agent = agentLoadable.state === "hasData" ? agentLoadable.data : null;
+  return (
+    <PermissionActionCardForTarget
+      block={block}
+      hasTarget={Boolean(agent)}
+      targetLoadableState={agentLoadable.state}
+      userGrantsLoadable={userGrantsLoadable}
+    />
+  );
+}
+
+function PermissionActionCard({ block }: { block: PermissionActionBlock }) {
+  return <AgentPermissionActionCard block={block} />;
+}
+
+function ChatConnectorActionConnectModal() {
+  const active = useGet(activeChatConnectorAction$);
+  const close = useSet(closeChatConnectorActionConnectDialog$);
+  const complete = useSet(completeChatConnectorActionConnect$);
+
+  if (!active) {
+    return null;
+  }
+
+  return (
+    <ConnectModal
+      agentId={active.agentId}
+      onClose={close}
+      onSuccess={() => {
+        complete();
+      }}
+    />
+  );
+}
+
+function isImageFilename(filename: string): boolean {
+  return /\.(png|jpe?g|gif|webp|svg|bmp|avif|heic|heif|tiff?|psd)$/i.test(
+    filename,
+  );
+}
+
+const CREDITS_PER_DOLLAR = 1000;
+const CREDIT_TOP_UP_OPTIONS = [100_000, 200_000, 300_000] as const;
+
+function formatCreditsUsd(credits: number): string {
+  const dollars = credits / CREDITS_PER_DOLLAR;
+  return dollars.toLocaleString("en-US", {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: Number.isInteger(dollars) ? 0 : 2,
+  });
+}
+
+function customCreditsFromForm(form: HTMLFormElement | null): number | null {
+  const element = form?.elements.namedItem("customUsd");
+  if (!(element instanceof HTMLInputElement)) {
+    return null;
+  }
+
+  const usd = Number(element.value);
+  const credits = usd * CREDITS_PER_DOLLAR;
+  if (!Number.isInteger(credits) || credits < 1000 || credits > 10_000_000) {
+    return null;
+  }
+  return credits;
+}
+
+function CreditsAvailableMessage() {
+  return (
+    <div className="max-w-md">
+      <p className="text-[0.9375rem] font-medium text-emerald-700 dark:text-emerald-300">
+        Credits available
+      </p>
+      <p className="mt-1 text-sm text-muted-foreground">
+        Your credits have been added. You can continue chatting with Zero.
+      </p>
+    </div>
+  );
+}
+
+function insufficientCreditsCopy(params: {
+  readonly isFree: boolean;
+  readonly requiresPro: boolean;
+  readonly roleResolved: boolean;
+  readonly canManageBilling: boolean;
+}): { readonly headline: string; readonly helper: string } {
+  const headline = params.requiresPro
+    ? "Upgrade to Pro to run Zero"
+    : params.isFree
+      ? "You've used your free credits"
+      : "You're out of credits";
+  if (!params.roleResolved) {
+    return { headline, helper: "Checking billing permissions..." };
+  }
+  if (!params.canManageBilling) {
+    return {
+      headline,
+      helper:
+        params.requiresPro || params.isFree
+          ? "Ask a workspace admin to upgrade to Pro so you can keep chatting with Zero."
+          : "Ask a workspace admin to add credits so you can keep chatting with Zero.",
+    };
+  }
+  return {
+    headline,
+    helper:
+      params.requiresPro || params.isFree
+        ? "Upgrade to Pro to keep chatting with Zero."
+        : "Add credits to keep chatting with Zero.",
+  };
+}
+
+function PaidCreditCheckoutActions({
+  redirecting,
+  handleCreditClick,
+}: {
+  readonly redirecting: boolean;
+  readonly handleCreditClick: (
+    selection: CreditCheckoutSelection,
+    event: ReactMouseEvent<HTMLButtonElement>,
+  ) => void;
+}) {
+  const handleCustomCreditClick = (
+    event: ReactMouseEvent<HTMLButtonElement>,
+  ) => {
+    const credits = customCreditsFromForm(event.currentTarget.form);
+    if (credits === null) {
+      toast.error("Enter between $1 and $10,000");
+      return;
+    }
+    handleCreditClick({ credits, customAmount: true }, event);
+  };
+
+  return (
+    <div className="mt-3 flex flex-col gap-2">
+      <div className="flex flex-wrap gap-2">
+        {CREDIT_TOP_UP_OPTIONS.map((credits) => {
+          return (
+            <button
+              key={credits}
+              type="button"
+              onClick={(event) => {
+                handleCreditClick({ credits }, event);
+              }}
+              disabled={redirecting}
+              className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-60"
+            >
+              {formatCreditsUsd(credits)}
+            </button>
+          );
+        })}
+        <details>
+          <summary
+            role="button"
+            className="inline-flex h-8 cursor-pointer list-none items-center rounded-md border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:bg-accent marker:hidden disabled:opacity-60 [&::-webkit-details-marker]:hidden"
+          >
+            Custom
+          </summary>
+          <form className="mt-2 flex flex-wrap items-center gap-2">
+            <span className="text-sm text-muted-foreground">$</span>
+            <input
+              type="text"
+              inputMode="numeric"
+              name="customUsd"
+              defaultValue="100"
+              onInput={(event) => {
+                event.currentTarget.value = event.currentTarget.value.replace(
+                  /\D/g,
+                  "",
+                );
+              }}
+              aria-label="Custom dollar amount"
+              className="h-8 w-24 rounded-md border border-input bg-background px-2 text-sm text-foreground outline-none transition-colors focus:border-ring"
+            />
+            <button
+              type="button"
+              onClick={handleCustomCreditClick}
+              disabled={redirecting}
+              className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-60"
+            >
+              {redirecting ? "Redirecting..." : "Buy"}
+            </button>
+          </form>
+        </details>
+      </div>
+    </div>
+  );
+}
+
+function InsufficientCreditsCard() {
+  const billingLoadable = useLoadable(billingStatusAsync$);
+  const [checkoutLoadable, checkout] = useLoadableSet(startCheckout$);
+  const [creditCheckoutLoadable, creditCheckout] =
+    useLoadableSet(startCreditCheckout$);
+  const setOrgManageOpen = useSet(setOrgManageDialogOpen$);
+  const setTab = useSet(setActiveOrgManageTab$);
+  const setSubPage = useSet(setBillingSubPage$);
+  const pageSignal = useGet(pageSignal$);
+
+  const billingResolved = billingLoadable.state === "hasData";
+  const tier = billingResolved ? billingLoadable.data.tier : null;
+  const credits = billingResolved ? billingLoadable.data.credits : null;
+  const isAdminLoadable = useLastLoadable(isOrgAdmin$);
+  const roleResolved = isAdminLoadable.state === "hasData";
+  const canManageBilling = roleResolved ? isAdminLoadable.data : false;
+  const requiresPro = tier === "pro-suspend" || tier === "limited-free-1";
+  const hasAvailableCredits = !requiresPro && credits !== null && credits > 0;
+  const isFree = tier === "free" || tier === "limited-free-1";
+  const shouldStartProCheckout = requiresPro || isFree;
+  const canShowBillingAction = billingResolved && canManageBilling;
+  const redirecting =
+    checkoutLoadable.state === "loading" ||
+    creditCheckoutLoadable.state === "loading";
+
+  if (hasAvailableCredits) {
+    return <CreditsAvailableMessage />;
+  }
+
+  const { headline, helper } = insufficientCreditsCopy({
+    isFree,
+    requiresPro,
+    roleResolved: billingResolved && roleResolved,
+    canManageBilling: billingResolved && canManageBilling,
+  });
+
+  const openBilling = () => {
+    setTab("billing");
+    setSubPage(false);
+    detach(setOrgManageOpen(true, pageSignal), Reason.DomCallback);
+  };
+
+  const handleUpgradeClick = (event: ReactMouseEvent<HTMLButtonElement>) => {
+    if (shouldStartProCheckout) {
+      const newTab = event.metaKey || event.ctrlKey;
+      detach(
+        checkout("pro", newTab, undefined, pageSignal),
+        Reason.DomCallback,
+      );
+      return;
+    }
+    openBilling();
+  };
+
+  const handleCreditClick = (
+    selection: CreditCheckoutSelection,
+    event: ReactMouseEvent<HTMLButtonElement>,
+  ) => {
+    const newTab = event.metaKey || event.ctrlKey;
+    detach(creditCheckout(selection, newTab, pageSignal), Reason.DomCallback);
+  };
+
+  return (
+    <div className="rounded-lg border border-border/60 bg-muted/30 px-3 py-3 max-w-md">
+      <p className="text-[0.9375rem] font-medium text-foreground">{headline}</p>
+      <p className="mt-1 text-sm text-muted-foreground">{helper}</p>
+      {!canShowBillingAction ? null : shouldStartProCheckout ? (
+        <button
+          type="button"
+          onClick={handleUpgradeClick}
+          disabled={redirecting}
+          className="mt-3 inline-flex h-8 items-center rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-60"
+        >
+          {redirecting ? "Redirecting..." : "Upgrade to Pro"}
+        </button>
+      ) : (
+        <PaidCreditCheckoutActions
+          redirecting={redirecting}
+          handleCreditClick={handleCreditClick}
+        />
+      )}
+    </div>
+  );
+}
+
+function isBillingRecoveryError(error: string): boolean {
+  const normalized = error.trim().toLowerCase();
+  return normalized === "insufficient_credits" || normalized === "pro_required";
+}
+
+function AssistantErrorContent({ error }: { error: string }) {
+  const setOrgManageOpen = useSet(setOrgManageDialogOpen$);
+  const setTab = useSet(setActiveOrgManageTab$);
+  const pageSignal = useGet(pageSignal$);
+
+  if (isBillingRecoveryError(error)) {
+    return <InsufficientCreditsCard />;
+  }
+
+  if (error.trim().toLowerCase() === "run cancelled") {
+    return (
+      <div
+        className="inline-flex items-center gap-2 bg-muted/50 px-3 py-1.5 text-[0.9375rem] text-muted-foreground"
+        style={{
+          border: "0.7px solid hsl(var(--border))",
+          borderRadius: "12px",
+        }}
+      >
+        <IconHandStop size={14} stroke={1.75} className="shrink-0" />
+        <span>Paused mid-thought — pick it back up whenever.</span>
+      </div>
+    );
+  }
+
+  const noProviderGuidance = RUN_ERROR_GUIDANCE.NO_MODEL_PROVIDER;
+  const isNoModelProvider =
+    noProviderGuidance !== undefined &&
+    error.toLowerCase().includes(noProviderGuidance.title.toLowerCase());
+
+  if (isNoModelProvider) {
+    return (
+      <div className="flex items-start gap-2 text-foreground">
+        <IconAlertCircle
+          size={16}
+          className="shrink-0 mt-[3px] text-amber-500"
+        />
+        <span>
+          No model provider configured yet.{" "}
+          <button
+            type="button"
+            className="inline-flex items-center gap-1 text-amber-500 underline underline-offset-2 hover:text-amber-400"
+            onClick={() => {
+              setTab("providers");
+              detach(setOrgManageOpen(true, pageSignal), Reason.DomCallback);
+            }}
+          >
+            Set one up in Workspace Settings
+          </button>{" "}
+          to get started.
+        </span>
+      </div>
+    );
+  }
+
+  const incompatibleGuidance = RUN_ERROR_GUIDANCE.PROVIDER_INCOMPATIBLE;
+  const isProviderIncompatible =
+    (incompatibleGuidance !== undefined &&
+      error.toLowerCase().includes(incompatibleGuidance.title.toLowerCase())) ||
+    error.includes("Cannot continue session") ||
+    error.includes("Invalid signature in thinking block");
+
+  if (isProviderIncompatible) {
+    return (
+      <div className="flex items-start gap-2 text-foreground">
+        <IconAlertCircle
+          size={16}
+          className="shrink-0 mt-[3px] text-amber-500"
+        />
+        <span>
+          This session was started with a different model provider and
+          can&apos;t be continued with the current one.{" "}
+          <Link
+            pathname="/"
+            className="inline-flex items-center gap-1 text-amber-500 underline underline-offset-2 hover:text-amber-400"
+          >
+            Start a new session
+          </Link>
+        </span>
+      </div>
+    );
+  }
+
+  const deletedGuidance = RUN_ERROR_GUIDANCE.PROVIDER_DELETED;
+  const isProviderDeleted =
+    deletedGuidance !== undefined &&
+    (error.toLowerCase().includes(deletedGuidance.title.toLowerCase()) ||
+      error.toLowerCase().includes(deletedGuidance.guidance.toLowerCase()));
+
+  if (isProviderDeleted) {
+    return (
+      <div className="flex items-start gap-2 text-foreground">
+        <IconAlertCircle
+          size={16}
+          className="shrink-0 mt-[3px] text-amber-500"
+        />
+        <span>
+          The model provider used by this thread has been deleted.{" "}
+          <Link
+            pathname="/"
+            className="inline-flex items-center gap-1 text-amber-500 underline underline-offset-2 hover:text-amber-400"
+          >
+            Start a new chat thread
+          </Link>{" "}
+          to continue.
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-start gap-2 text-destructive">
+      <IconAlertCircle size={16} className="shrink-0 mt-[3px]" />
+      <Markdown
+        source={error}
+        style={{ fontSize: "inherit", lineHeight: "inherit" }}
+      />
+    </div>
+  );
+}
+
+function AssistantBubbleAvatar({ thread }: { thread: ChatThreadSignals }) {
+  const agentId = useLastResolved(thread.agentId$) ?? "";
+  return (
+    <Link
+      pathname="/agents/:agentId"
+      options={{ pathParams: { agentId } }}
+      className="h-7 w-7 @[900px]:h-9 @[900px]:w-9 shrink-0 @[900px]:mt-0.5 overflow-hidden rounded-xl transition-colors duration-150 hover:bg-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+      aria-label="View agent profile"
+    >
+      <AgentAvatarImg
+        name={agentId}
+        alt=""
+        className="h-7 w-7 @[900px]:h-9 @[900px]:w-9 rounded-full object-cover object-top"
+      />
+    </Link>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Paged message rendering — renders from visibleRenderedChatGroups$ (flat data,
+// no signal-based run loops).
+// ---------------------------------------------------------------------------
+
+function PagedGroupRow({
+  group,
+  thread,
+  runGroupFolds,
+  completedWorkFold,
+}: {
+  group: GroupedChatMessageGroup;
+  thread: ChatThreadSignals;
+  runGroupFolds?: readonly RunGroupFoldControl[];
+  completedWorkFold?: {
+    groups: readonly GroupedChatMessageGroup[];
+    hiddenGroups: readonly GroupedChatMessageGroup[];
+    expanded: boolean;
+    onToggle: () => void;
+  };
+}) {
+  if (group.role === "user") {
+    return (
+      <PagedUserGroup
+        group={group}
+        thread={thread}
+        runGroupFolds={runGroupFolds}
+      />
+    );
+  }
+  return (
+    <PagedAssistantGroup
+      group={group}
+      thread={thread}
+      runGroupFolds={runGroupFolds}
+      completedWorkFold={completedWorkFold}
+    />
+  );
+}
+
+function PagedUserGroup({
+  group,
+  thread,
+  runGroupFolds,
+}: {
+  group: GroupedChatMessageGroup;
+  thread: ChatThreadSignals;
+  runGroupFolds?: readonly RunGroupFoldControl[];
+}) {
+  return (
+    <>
+      {group.messages.map((msg) => {
+        return <PagedUserMessage key={msg.id} message={msg} thread={thread} />;
+      })}
+      {runGroupFolds?.map((fold) => {
+        return <RunGroupFoldRow key={fold.fold.key} control={fold} />;
+      })}
+    </>
+  );
+}
+
+function isWorkflowUserMessage(
+  message: EnrichedChatMessage,
+): message is EnrichedChatMessage & { role: "user" } {
+  return message.role === "user" && hasWorkflowMessageMetadata(message);
+}
+
+function hasWorkflowMessageMetadata(message: EnrichedChatMessage): boolean {
+  return message.workflowSnapshot !== undefined;
+}
+
+function workflowSnapshotTitle(
+  workflowSnapshot: NonNullable<EnrichedChatMessage["workflowSnapshot"]>,
+): string {
+  return (
+    workflowSnapshot.displayName?.trim() ||
+    workflowSnapshot.name.trim() ||
+    "Workflow"
+  );
+}
+
+function workflowMessageBrief(
+  workflowSnapshot: NonNullable<EnrichedChatMessage["workflowSnapshot"]>,
+): string | null {
+  const brief =
+    workflowSnapshot.triggerBrief?.trim() ||
+    workflowSnapshot.description?.trim() ||
+    "";
+  return brief.length > 0 ? brief : null;
+}
+
+function workflowMessageBody(
+  message: EnrichedChatMessage & { role: "user" },
+): string {
+  const workflowSnapshot = message.workflowSnapshot;
+  if (!workflowSnapshot) {
+    return message.content?.trim() || "Workflow";
+  }
+  return (
+    workflowMessageBrief(workflowSnapshot) ??
+    workflowSnapshotTitle(workflowSnapshot)
+  );
+}
+
+function resolveAttachments(
+  message: PagedChatMessage,
+  parsed: { filename: string; url: string }[],
+) {
+  const source =
+    message.attachFiles && message.attachFiles.length > 0
+      ? message.attachFiles
+      : parsed;
+  return source.map((f) => {
+    const contentType =
+      "contentType" in f && typeof f.contentType === "string"
+        ? f.contentType
+        : undefined;
+    const kind = classifyChatAttachment({
+      filename: f.filename,
+      url: f.url,
+      contentType,
+    });
+    return {
+      filename: f.filename,
+      url: f.url,
+      contentType,
+      isImage: kind === "image" || isImageFilename(f.filename),
+      kind,
+    };
+  });
+}
+
+function attachmentIdFromUrl(url: string): string | null {
+  if (!URL.canParse(url, window.location.origin)) {
+    return null;
+  }
+  const parsed = new URL(url, window.location.origin);
+  const match = parsed.pathname.match(/^\/f\/[^/]+\/([^/]+)\/[^/]+$/);
+  return match?.[1] ?? null;
+}
+
+function clipboardAttachmentsFromMessage(
+  message: PagedChatMessage,
+  parsed: { filename: string; url: string }[],
+): ChatClipboardAttachment[] {
+  const source =
+    message.attachFiles && message.attachFiles.length > 0
+      ? message.attachFiles
+      : parsed;
+  return source.map((f) => {
+    const contentType =
+      "contentType" in f && typeof f.contentType === "string"
+        ? f.contentType
+        : undefined;
+    const kind = classifyChatAttachment({
+      filename: f.filename,
+      url: f.url,
+      contentType,
+    });
+    return {
+      id:
+        "id" in f && typeof f.id === "string"
+          ? f.id
+          : attachmentIdFromUrl(f.url),
+      filename: f.filename,
+      url: f.url,
+      contentType: contentType ?? contentTypeForBodyPreviewKind(kind),
+      size: "size" in f && typeof f.size === "number" ? f.size : 0,
+    };
+  });
+}
+
+function UserMessageAttachments({
+  attachments,
+  onImageClick,
+}: {
+  attachments: ReturnType<typeof resolveAttachments>;
+  onImageClick: (url: string) => void;
+}) {
+  const openVideoLightbox = useSet(openAttachmentVideoLightbox$);
+
+  if (attachments.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="mb-2 flex max-w-[85%] flex-wrap justify-end gap-2">
+      {attachments.map((a) => {
+        if (a.isImage) {
+          return (
+            <ChatImagePreviewLink
+              key={a.url}
+              alt={a.filename}
+              ariaLabel={`Preview ${a.filename}`}
+              imageClassName="block h-full w-full object-contain"
+              linkClassName={CHAT_INLINE_IMAGE_PREVIEW_CLASS}
+              onPreview={() => {
+                onImageClick(a.url);
+              }}
+              placeholderClassName="h-full w-full"
+              url={a.url}
+            />
+          );
+        }
+        if (a.kind === "video") {
+          return (
+            <ChatVideoPreviewButton
+              key={a.url}
+              ariaLabel={`Preview ${a.filename}`}
+              buttonClassName={CHAT_INLINE_VIDEO_ATTACHMENT_PREVIEW_CLASS}
+              filename={a.filename}
+              onPreview={() => {
+                openVideoLightbox({
+                  url: a.url,
+                  filename: a.filename,
+                });
+              }}
+              posterClassName="h-full w-full"
+              url={a.url}
+              videoClassName="h-full w-full object-contain"
+            />
+          );
+        }
+        if (
+          a.kind === "markdown" ||
+          a.kind === "text" ||
+          a.kind === "json" ||
+          a.kind === "csv" ||
+          a.kind === "pdf" ||
+          a.kind === "html"
+        ) {
+          return (
+            <PreviewableFileAttachmentChip
+              key={a.url}
+              filename={a.filename}
+              url={a.url}
+              kind={a.kind}
+            />
+          );
+        }
+        if (a.kind === "audio") {
+          return (
+            <PreviewableAudioAttachmentChip
+              key={a.url}
+              filename={a.filename}
+              url={a.url}
+              contentType={a.contentType}
+            />
+          );
+        }
+        return (
+          <FileAttachmentChip
+            key={a.url}
+            filename={a.filename}
+            url={a.url}
+            contentType={a.contentType}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+function UserMessageActions({
+  canCopy,
+  copied,
+  onCopy,
+}: {
+  canCopy: boolean;
+  copied: boolean;
+  onCopy: () => void;
+}) {
+  if (!canCopy) {
+    return null;
+  }
+  return (
+    <div className="flex justify-end gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
+      <button
+        type="button"
+        onClick={onCopy}
+        className="p-1 rounded-md text-muted-foreground/60 hover:text-foreground hover:bg-accent transition-colors duration-150"
+        aria-label="Copy message"
+      >
+        {copied ? (
+          <IconCheck size={18} stroke={1.5} />
+        ) : (
+          <IconCopy size={18} stroke={1.5} />
+        )}
+      </button>
+    </div>
+  );
+}
+
+function formatSelectionIdLabel(selectionId: string): string {
+  const label = selectionId
+    .replace(/^template:/, "")
+    .replace(/^video-template:/, "")
+    .replace(/^workflow-template:/, "")
+    .replace(/^html-ppt-/, "")
+    .replace(/-/g, " ");
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
+function generationTemplateLabel(
+  value: GenerationTemplateRequest | undefined,
+): string | null {
+  if (!value) {
+    return null;
+  }
+  if (value.type === "video") {
+    const item = findVideoTemplateItem(value.selection.stylePresetId);
+    return item?.title ?? formatSelectionIdLabel(value.selection.stylePresetId);
+  }
+  if (value.type === "workflow") {
+    const item = findWorkflowTemplateItem(value.selection.workflowTemplateId);
+    return (
+      item?.title ?? formatSelectionIdLabel(value.selection.workflowTemplateId)
+    );
+  }
+  if (value.type === "illustration") {
+    const item = ILLUSTRATION_TEMPLATE_ITEMS.find((candidate) => {
+      return (
+        candidate.illustrationStyleId === value.selection.illustrationStyleId
+      );
+    });
+    return (
+      item?.title ?? formatSelectionIdLabel(value.selection.illustrationStyleId)
+    );
+  }
+  if (value.type === "website") {
+    const item = findWebsiteTemplateItem(value.selection.websiteTemplateId);
+    return (
+      item?.title ?? formatSelectionIdLabel(value.selection.websiteTemplateId)
+    );
+  }
+  const item = PRESENTATION_TEMPLATE_PICKER_ITEMS.find((candidate) => {
+    return candidate.templateId === value.selection.templateId;
+  });
+  return item?.title ?? formatSelectionIdLabel(value.selection.templateId);
+}
+
+function generationTemplateTypeLabel(
+  value: GenerationTemplateRequest | undefined,
+): string | null {
+  if (!value) {
+    return null;
+  }
+  if (value.type === "video") {
+    return "Video";
+  }
+  if (value.type === "illustration") {
+    return "Illustration";
+  }
+  if (value.type === "workflow") {
+    return "Workflow";
+  }
+  if (value.type === "website") {
+    return "Website";
+  }
+  return "Presentation";
+}
+
+function UserMessageGenerationTemplate({
+  generationTemplate,
+}: {
+  generationTemplate: GenerationTemplateRequest | undefined;
+}) {
+  const label = generationTemplateLabel(generationTemplate);
+  const typeLabel = generationTemplateTypeLabel(generationTemplate);
+  if (!label || !typeLabel) {
+    return null;
+  }
+  const className =
+    "mb-1.5 flex max-w-[85%] items-center gap-1.5 self-end text-xs font-medium text-muted-foreground";
+  const content = (
+    <>
+      {generationTemplate?.type === "video" ? (
+        <IconVideo size={15} stroke={1.8} className="shrink-0" />
+      ) : generationTemplate?.type === "illustration" ? (
+        <IconPhoto size={15} stroke={1.8} className="shrink-0" />
+      ) : generationTemplate?.type === "workflow" ? (
+        <IconRoute size={15} stroke={1.8} className="shrink-0" />
+      ) : generationTemplate?.type === "website" ? (
+        <IconWorld size={15} stroke={1.8} className="shrink-0" />
+      ) : (
+        <IconPresentation size={15} stroke={1.8} className="shrink-0" />
+      )}
+      <span className="shrink-0">{typeLabel}</span>
+      <span className="shrink-0">·</span>
+      <span className="min-w-0 truncate">{label}</span>
+    </>
+  );
+  return (
+    <div
+      aria-label={`Message template ${label}`}
+      className={className}
+      title={`${typeLabel} · ${label}`}
+    >
+      {content}
+    </div>
+  );
+}
+
+function WorkflowUserMessage({
+  message,
+}: {
+  message: EnrichedChatMessage & { role: "user" };
+}) {
+  const workflowSnapshot = message.workflowSnapshot;
+  if (!workflowSnapshot) {
+    return null;
+  }
+  const workflowTitle = workflowSnapshotTitle(workflowSnapshot);
+  const workflowBody = workflowMessageBody(message);
+  const bubbleClassName =
+    "zero-chat-bubble-user rounded-xl max-w-[85%] text-[0.9375rem] leading-[1.7] [overflow-wrap:anywhere] overflow-hidden whitespace-pre-wrap transition-colors duration-150";
+  const body = (
+    <div className={bubbleClassName}>
+      <div className="px-4 py-3">{workflowBody}</div>
+    </div>
+  );
+  const workflowId = workflowSnapshot.id;
+  const linked = workflowId !== undefined;
+
+  return (
+    <div data-role="user" className="group">
+      <div className="flex flex-col items-end min-w-0 animate-in fade-in slide-in-from-bottom-2 duration-300 @[900px]:grid @[900px]:grid-cols-[36px_minmax(0,1fr)] @[900px]:gap-2.5 @[900px]:-ml-[46px] @[900px]:items-start">
+        <div className="hidden @[900px]:block @[900px]:w-9 @[900px]:h-9 @[900px]:shrink-0" />
+        <div className="flex w-full flex-col items-end">
+          <div
+            aria-label={`Workflow ${workflowTitle}`}
+            className="mb-1.5 flex max-w-[85%] items-center gap-1.5 self-end text-xs font-medium text-muted-foreground"
+            title={workflowTitle}
+          >
+            <IconRoute size={15} stroke={1.8} className="shrink-0" />
+            <span className="min-w-0 truncate">{workflowTitle}</span>
+          </div>
+          {linked ? (
+            <Link
+              pathname={ROUTES.workflowDetailAutomations}
+              options={{
+                pathParams: {
+                  workflowId,
+                },
+              }}
+              className="contents"
+              aria-label={`Open workflow ${workflowSnapshotTitle(
+                workflowSnapshot,
+              )}`}
+            >
+              {body}
+            </Link>
+          ) : (
+            body
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GoalUserMessage({
+  message,
+  bodyBlocks,
+  openLightbox,
+}: {
+  message: EnrichedChatMessage & { role: "user" };
+  bodyBlocks: BodyRenderBlock[];
+  openLightbox: (url: string) => void;
+}) {
+  const objectiveBrief = message.goalSnapshot?.objectiveBrief?.trim();
+  return (
+    <div data-role="user" className="group">
+      <div className="flex flex-col items-end min-w-0 animate-in fade-in slide-in-from-bottom-2 duration-300 @[900px]:grid @[900px]:grid-cols-[36px_minmax(0,1fr)] @[900px]:gap-2.5 @[900px]:-ml-[46px] @[900px]:items-start">
+        <div className="hidden @[900px]:block @[900px]:w-9 @[900px]:h-9 @[900px]:shrink-0" />
+        <div className="flex w-full flex-col items-end">
+          <div
+            aria-label="Goal"
+            className="mb-1.5 flex max-w-[85%] items-center gap-1.5 self-end text-xs font-medium text-muted-foreground"
+          >
+            <IconTarget size={15} stroke={1.8} className="shrink-0" />
+            <span>Goal</span>
+          </div>
+          {objectiveBrief ? (
+            <div className="zero-chat-bubble-user rounded-xl max-w-[85%] text-[0.9375rem] leading-[1.7] [overflow-wrap:anywhere] overflow-hidden ring-1 ring-emerald-900/10">
+              <div className="px-4 py-3 whitespace-pre-wrap">
+                {objectiveBrief}
+              </div>
+            </div>
+          ) : bodyBlocks.length > 0 ? (
+            <div className="zero-chat-bubble-user rounded-xl max-w-[85%] text-[0.9375rem] leading-[1.7] [overflow-wrap:anywhere] overflow-hidden ring-1 ring-emerald-900/10">
+              <div className="px-4 py-3">
+                <BodyContentBlocks
+                  blocks={bodyBlocks}
+                  openLightbox={openLightbox}
+                  hardBreaks
+                  escapeMarkdownHtml
+                  markdownMediaPreview={false}
+                />
+              </div>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PagedUserMessage({
+  message,
+  thread,
+}: {
+  message: EnrichedChatMessage;
+  thread: ChatThreadSignals;
+}) {
+  const content = message.content ?? "";
+  // Two attachment sources coexist: the structured `attachFiles` field
+  // (current flow) and legacy `[Attached file: ...](url)` inline lines left
+  // over from messages sent before #10243 split the flows. Use the structured
+  // source when it's present and fall back to inline parsing otherwise.
+  const { cleanContent, parsed } = parseInlineAttachments(content);
+  // `ATTACH_ONLY_PLACEHOLDER` is the server-side placeholder stored when the
+  // user sent only files with no typed text — strip it so the bubble shows
+  // just the attachments.
+  const strippedContent =
+    message.attachFiles &&
+    message.attachFiles.length > 0 &&
+    cleanContent.trim() === ATTACH_ONLY_PLACEHOLDER
+      ? ""
+      : cleanContent;
+  const bodyBlocks = enrichBlocksWithTextPreviews(
+    parseBodyRenderBlocks(strippedContent, { previews: false }).blocks,
+  );
+  const pageSignal = useGet(pageSignal$);
+  const openImageLightbox = useSet(openAttachmentImageLightbox$);
+  const openLightbox = (url: string) => {
+    openImageLightbox(url);
+  };
+  const copiedId = useGet(thread.copiedMessageId$);
+  const copied = copiedId === message.id;
+  const copyMessage = useSet(thread.copyMessage$);
+  const allAttachments = resolveAttachments(message, parsed);
+  const clipboardAttachments = clipboardAttachmentsFromMessage(message, parsed);
+  const copyText = strippedContent;
+  const canCopy = copyText.trim().length > 0 || clipboardAttachments.length > 0;
+
+  const handleCopy = () => {
+    if (!canCopy) {
+      return;
+    }
+    detach(
+      copyMessage(
+        message.id,
+        { text: copyText, attachments: clipboardAttachments },
+        pageSignal,
+      ),
+      Reason.DomCallback,
+    );
+  };
+
+  if (isWorkflowUserMessage(message)) {
+    return <WorkflowUserMessage message={message} />;
+  }
+
+  if (isGoalUserMessage(message)) {
+    return (
+      <GoalUserMessage
+        message={message}
+        bodyBlocks={bodyBlocks}
+        openLightbox={openLightbox}
+      />
+    );
+  }
+
+  return (
+    <div data-role="user" className="group">
+      <div className="flex flex-col items-end min-w-0 animate-in fade-in slide-in-from-bottom-2 duration-300 @[900px]:grid @[900px]:grid-cols-[36px_minmax(0,1fr)] @[900px]:gap-2.5 @[900px]:-ml-[46px] @[900px]:items-start">
+        <div className="hidden @[900px]:block @[900px]:w-9 @[900px]:h-9 @[900px]:shrink-0" />
+        <div className="flex flex-col items-end w-full">
+          <UserMessageGenerationTemplate
+            generationTemplate={message.generationTemplate}
+          />
+          <UserMessageAttachments
+            attachments={allAttachments}
+            onImageClick={openLightbox}
+          />
+          {bodyBlocks.length > 0 && (
+            <div className="zero-chat-bubble-user rounded-xl max-w-[85%] text-[0.9375rem] leading-[1.7] [overflow-wrap:anywhere] overflow-hidden">
+              <div className="px-4 py-3">
+                <BodyContentBlocks
+                  blocks={bodyBlocks}
+                  openLightbox={openLightbox}
+                  hardBreaks
+                  escapeMarkdownHtml
+                  markdownMediaPreview={false}
+                />
+              </div>
+            </div>
+          )}
+          <UserMessageActions
+            canCopy={canCopy}
+            copied={copied}
+            onCopy={handleCopy}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PagedAssistantGroup({
+  group,
+  thread,
+  runGroupFolds,
+  completedWorkFold,
+}: {
+  group: GroupedChatMessageGroup;
+  thread: ChatThreadSignals;
+  runGroupFolds?: readonly RunGroupFoldControl[];
+  completedWorkFold?: {
+    groups: readonly GroupedChatMessageGroup[];
+    hiddenGroups: readonly GroupedChatMessageGroup[];
+    expanded: boolean;
+    onToggle: () => void;
+  };
+}) {
+  const hasRenderableMessage = group.messages.some((message) => {
+    return isRenderableAssistantMessage(message);
+  });
+  const hasRunGroupFolds = (runGroupFolds?.length ?? 0) > 0;
+  const showCompletedWorkFold = completedWorkFold && !hasRunGroupFolds;
+  if (!hasRenderableMessage && !completedWorkFold && !hasRunGroupFolds) {
+    return null;
+  }
+
+  const groupElementId = `chat-message-group-${group.beginMessageId}`;
+  const fullContent = group.messages
+    .map((m) => {
+      return m.content;
+    })
+    .filter(Boolean)
+    .join("\n\n");
+  let renderedAssistantMessageCount = 0;
+  const renderAssistantMessageItem = (message: EnrichedChatMessage) => {
+    const isRenderable = isRenderableAssistantMessage(message);
+    const compactTop = isRenderable && renderedAssistantMessageCount > 0;
+    if (isRenderable) {
+      renderedAssistantMessageCount += 1;
+    }
+    return (
+      <PagedAssistantMessageItem
+        key={message.id}
+        message={message}
+        thread={thread}
+        compactTop={compactTop}
+      />
+    );
+  };
+
+  return (
+    <div
+      id={groupElementId}
+      data-role="assistant"
+      className="flex flex-col gap-1 animate-in fade-in slide-in-from-bottom-2 duration-300"
+    >
+      <div className="flex flex-col gap-2 @[900px]:grid @[900px]:grid-cols-[36px_minmax(0,1fr)] @[900px]:gap-2.5 @[900px]:-ml-[46px] @[900px]:items-start">
+        <AssistantBubbleAvatar thread={thread} />
+        <div className="relative flex flex-col gap-2">
+          {runGroupFolds?.map((fold) => {
+            return (
+              <RunGroupFoldRow key={fold.fold.key} control={fold} embedded />
+            );
+          })}
+          {showCompletedWorkFold && (
+            <CompletedWorkFoldRow
+              groups={completedWorkFold.groups}
+              expanded={completedWorkFold.expanded}
+              onToggle={completedWorkFold.onToggle}
+            />
+          )}
+          {showCompletedWorkFold && completedWorkFold.expanded
+            ? completedWorkFold.hiddenGroups.map((hiddenGroup) => {
+                return (
+                  <div key={hiddenGroup.beginMessageId} className="contents">
+                    {hiddenGroup.messages.map((msg) => {
+                      return renderAssistantMessageItem(msg);
+                    })}
+                  </div>
+                );
+              })
+            : null}
+          {group.messages.map((msg) => {
+            return renderAssistantMessageItem(msg);
+          })}
+        </div>
+      </div>
+      <PagedGroupActions group={group} content={fullContent} thread={thread} />
+    </div>
+  );
+}
+
+function PagedAssistantMessageItem({
+  message,
+  thread,
+  compactTop = false,
+}: {
+  message: EnrichedChatMessage;
+  thread: ChatThreadSignals;
+  compactTop?: boolean;
+}) {
+  const openImageLightbox = useSet(openAttachmentImageLightbox$);
+  const openLightbox = (url: string) => {
+    openImageLightbox(url);
+  };
+
+  if (message.mailDraft) {
+    return (
+      <div
+        className={cn(
+          "zero-chat-bubble-assistant px-0 min-w-0",
+          compactTop ? "@[900px]:pt-0" : "@[900px]:pt-2.5",
+        )}
+      >
+        <MailDraftCard
+          threadId={thread.threadId}
+          messageId={message.id}
+          mailDraft={message.mailDraft}
+        />
+      </div>
+    );
+  }
+
+  if (message.error) {
+    return (
+      <div
+        className={cn(
+          "zero-chat-bubble-assistant px-0 text-[0.9375rem] leading-[1.7] min-w-0 [overflow-wrap:anywhere]",
+          compactTop ? "@[900px]:pt-0" : "@[900px]:pt-2.5",
+        )}
+      >
+        <AssistantErrorContent error={message.error} />
+      </div>
+    );
+  }
+
+  if (message.content) {
+    const { blocks } = message;
+    return (
+      <div
+        className={cn(
+          "zero-chat-bubble-assistant px-0 text-[0.9375rem] leading-[1.7] min-w-0 [overflow-wrap:anywhere]",
+          compactTop ? "@[900px]:pt-0" : "@[900px]:pt-2.5",
+        )}
+      >
+        {blocks.length > 0 ? (
+          <BodyContentBlocks
+            blocks={blocks}
+            openLightbox={openLightbox}
+            hardBreaks={false}
+          />
+        ) : null}
+      </div>
+    );
+  }
+
+  return null;
+}
+
+function formatCredits(value: number): string {
+  return value.toLocaleString("en-US");
+}
+
+interface RunUsageDisplayRow {
+  readonly key: string;
+  readonly label: string;
+  readonly credits: number;
+}
+
+function titleCaseUsageToken(token: string): string {
+  const upper = token.toUpperCase();
+  if (["AI", "API", "GLM", "GPT", "ID", "SQL", "URL", "VM0"].includes(upper)) {
+    return upper;
+  }
+
+  return token.charAt(0).toUpperCase() + token.slice(1);
+}
+
+function formatUsageIdentifier(value: string): string {
+  const normalized = value.trim();
+  if (!normalized) {
+    return "Usage";
+  }
+
+  return normalized
+    .split(/[/._-]+/)
+    .filter((token) => {
+      return token.length > 0;
+    })
+    .map(titleCaseUsageToken)
+    .join(" ");
+}
+
+function isUsageModelBackedKind(kind: string): boolean {
+  return kind === "model" || kind === "image" || kind === "video";
+}
+
+function isUsageCategoryPart(part: string): boolean {
+  return part.startsWith("tokens.") || part.startsWith("output_");
+}
+
+function stripUsageProviderPrefix(value: string): string {
+  const normalized = value.trim();
+  if (normalized.startsWith("fal-ai/")) {
+    return normalized.slice("fal-ai/".length);
+  }
+  if (normalized.startsWith("bytedance/")) {
+    return normalized.slice("bytedance/".length);
+  }
+  if (normalized.startsWith("dreamina-")) {
+    return normalized.slice("dreamina-".length);
+  }
+  return normalized;
+}
+
+function getUsageModelDisplayName(model: string): string {
+  const directDisplayName = getModelDisplayName(model);
+  if (directDisplayName !== model) {
+    return directDisplayName;
+  }
+
+  const strippedModel = stripUsageProviderPrefix(model);
+  const strippedDisplayName = getModelDisplayName(strippedModel);
+  if (strippedDisplayName !== strippedModel) {
+    return strippedDisplayName;
+  }
+
+  return formatUsageIdentifier(strippedModel);
+}
+
+function usageDisplayLabel(kind: string, provider: string): string {
+  if (isUsageModelBackedKind(kind) && provider && provider !== "unknown") {
+    return getUsageModelDisplayName(provider);
+  }
+
+  if (provider && provider !== "unknown") {
+    return formatUsageIdentifier(provider);
+  }
+
+  return formatUsageIdentifier(kind);
+}
+
+function parseUsageKind(kind: string): {
+  readonly kind: string;
+  readonly provider?: string;
+} {
+  const parts = kind.split("/");
+  const parsedKind = parts[0];
+  if (isUsageModelBackedKind(parsedKind) && parts.length >= 2) {
+    const categoryIndex = parts.findIndex((part, index) => {
+      return index > 1 && isUsageCategoryPart(part);
+    });
+    const providerParts =
+      categoryIndex > 1 ? parts.slice(1, categoryIndex) : parts.slice(1);
+    const provider = providerParts.join("/");
+    if (provider) {
+      return { kind: parsedKind, provider };
+    }
+  }
+
+  return { kind };
+}
+
+function buildRunUsageDisplayRows(
+  usage: ChatMessageUsagePayload,
+): readonly RunUsageDisplayRow[] {
+  const rows = new Map<string, RunUsageDisplayRow>();
+
+  for (const kindBreakdown of usage.breakdown) {
+    const parsed = parseUsageKind(kindBreakdown.kind);
+    for (const providerBreakdown of kindBreakdown.providers) {
+      const provider = parsed.provider ?? providerBreakdown.provider;
+      const key = `${parsed.kind}:${provider}`;
+      const existing = rows.get(key);
+      const credits = Math.max(0, providerBreakdown.credits);
+      rows.set(key, {
+        key,
+        label: existing?.label ?? usageDisplayLabel(parsed.kind, provider),
+        credits: (existing?.credits ?? 0) + credits,
+      });
+    }
+  }
+
+  return Array.from(rows.values());
+}
+
+function UsageChip({
+  usage,
+  title,
+  ariaLabel,
+  contentAlign = "start",
+  open,
+  setOpen,
+}: {
+  usage: ChatMessageUsagePayload;
+  title: string;
+  ariaLabel: string;
+  contentAlign?: "start" | "center" | "end";
+  open: boolean;
+  setOpen: (open: boolean) => void;
+}) {
+  const total = formatCredits(usage.totalCredits);
+  const displayRows = buildRunUsageDisplayRows(usage);
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          className="inline-flex h-7 items-center gap-1 rounded-md px-1.5 text-xs font-medium text-muted-foreground/70 hover:bg-accent hover:text-foreground transition-colors duration-150"
+          aria-label={`${ariaLabel} ${total}`}
+        >
+          <IconCoins size={17} stroke={1.5} />
+          <span>{total}</span>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent side="bottom" align={contentAlign} className="w-72 p-3">
+        <div className="flex items-center justify-between gap-3 text-sm font-medium">
+          <span>{title}</span>
+          <span>{total}</span>
+        </div>
+        <div className="mt-3 flex flex-col gap-1.5">
+          {displayRows.map((row) => {
+            return (
+              <div
+                key={row.key}
+                className="flex items-center justify-between gap-3 text-xs"
+              >
+                <span className="min-w-0 truncate text-muted-foreground">
+                  {row.label}
+                </span>
+                <span className="shrink-0 text-foreground">
+                  {formatCredits(row.credits)}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+function RunUsageChip({
+  runId,
+  usage,
+}: {
+  runId: string;
+  usage: ChatMessageUsagePayload;
+}) {
+  const openRunId = useGet(runUsagePopoverOpenRunId$);
+  const setOpenRunId = useSet(setRunUsagePopoverOpenRunId$);
+
+  return (
+    <UsageChip
+      usage={usage}
+      title="Credit usage"
+      ariaLabel="Credit usage"
+      open={openRunId === runId}
+      setOpen={(open) => {
+        setOpenRunId(open ? runId : null);
+      }}
+    />
+  );
+}
+
+function PagedGroupPrimaryActions({
+  firstRunId,
+  hasContent,
+  usage,
+  copied,
+  onCopy,
+}: {
+  firstRunId: string | undefined;
+  hasContent: boolean;
+  usage: ChatMessageUsagePayload | undefined;
+  copied: boolean;
+  onCopy: () => void;
+}) {
+  return (
+    <div className="flex items-center gap-1" data-testid="chat-message-actions">
+      {firstRunId && (
+        <TooltipProvider delayDuration={300}>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Link
+                pathname="/activities/:activityRunId"
+                options={{
+                  pathParams: { activityRunId: firstRunId },
+                }}
+                className="p-1 rounded-md text-muted-foreground/60 hover:text-foreground hover:bg-accent transition-colors duration-150"
+                aria-label="View run logs"
+              >
+                <IconChartLine size={18} stroke={1.5} />
+              </Link>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">View activity logs</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      )}
+      {hasContent && (
+        <TooltipProvider delayDuration={300}>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={onCopy}
+                className="p-1 rounded-md text-muted-foreground/60 hover:text-foreground hover:bg-accent transition-colors duration-150"
+                aria-label="Copy message"
+              >
+                {copied ? (
+                  <IconCheck size={18} stroke={1.5} />
+                ) : (
+                  <IconCopy size={18} stroke={1.5} />
+                )}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              {copied ? "Copied!" : "Copy message"}
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      )}
+      {usage && firstRunId && <RunUsageChip runId={firstRunId} usage={usage} />}
+    </div>
+  );
+}
+
+function PagedGroupActions({
+  group,
+  content,
+  thread,
+}: {
+  group: GroupedChatMessageGroup;
+  content: string;
+  thread: ChatThreadSignals;
+}) {
+  const pageSignal = useGet(pageSignal$);
+  const copiedId = useGet(thread.copiedMessageId$);
+  const copied = copiedId === group.beginMessageId;
+  const copyMessage = useSet(thread.copyMessage$);
+
+  const firstRunId = group.messages.find((m) => {
+    return m.runId;
+  })?.runId;
+  const usage = group.usage;
+  const hasContent = content.length > 0;
+
+  if (group.role === "user") {
+    return null;
+  }
+
+  const handleCopy = () => {
+    if (!content) {
+      return;
+    }
+    detach(
+      copyMessage(
+        group.beginMessageId,
+        { text: content, attachments: [] },
+        pageSignal,
+      ),
+      Reason.DomCallback,
+    );
+  };
+
+  return (
+    <div className="@[900px]:grid @[900px]:grid-cols-[36px_minmax(0,1fr)] @[900px]:gap-2.5 @[900px]:-ml-[46px]">
+      <div className="hidden @[900px]:block" />
+      <div className="flex items-center justify-between pt-2 pb-1 gap-2 -ml-1">
+        <PagedGroupPrimaryActions
+          firstRunId={firstRunId}
+          hasContent={hasContent}
+          usage={usage}
+          copied={copied}
+          onCopy={handleCopy}
+        />
+      </div>
+    </div>
+  );
+}

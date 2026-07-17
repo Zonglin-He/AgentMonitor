@@ -1,0 +1,317 @@
+import Ably from "ably";
+import type { ZeroBuiltInGenerationRealtimeSubscription } from "@vm0/api-contracts/contracts/zero-built-in-generation";
+
+import { env } from "../../lib/env";
+import { logger } from "../../lib/log";
+import { singleton } from "../../lib/singleton";
+import { tapError } from "../utils";
+
+const L = logger("Realtime");
+
+const ablyClient = singleton((): Ably.Rest => {
+  const client = new Ably.Rest({ key: env("ABLY_API_KEY"), queryTime: true });
+  L.debug("Ably client initialised");
+  return client;
+});
+
+function getUserChannelName(userId: string): string {
+  return `user:${userId}`;
+}
+
+function getBuiltInGenerationEventName(generationId: string): string {
+  return `built-in-generation:${generationId}`;
+}
+
+export async function createPlatformUserRealtimeToken(
+  userId: string,
+): Promise<Ably.TokenRequest> {
+  const channelName = getUserChannelName(userId);
+  const tokenRequest = await ablyClient().auth.createTokenRequest({
+    capability: {
+      [channelName]: ["subscribe"],
+    },
+    ttl: 60 * 60 * 1000,
+    clientId: userId,
+  });
+  L.debug(`Generated platform realtime token for user:${userId}`);
+  return tokenRequest;
+}
+
+export async function createBuiltInGenerationRealtimeSubscription(
+  userId: string,
+  generationId: string,
+): Promise<ZeroBuiltInGenerationRealtimeSubscription> {
+  return {
+    channelName: getUserChannelName(userId),
+    eventName: getBuiltInGenerationEventName(generationId),
+    tokenRequest: await createPlatformUserRealtimeToken(userId),
+  };
+}
+
+export async function createRunnerGroupRealtimeToken(
+  group: string,
+): Promise<Ably.TokenRequest> {
+  const tokenRequest = await ablyClient().auth.createTokenRequest({
+    capability: {
+      [`runner-group:${group}`]: ["subscribe"],
+    },
+    ttl: 60 * 60 * 1000,
+  });
+  L.debug(`Generated runner group realtime token for ${group}`);
+  return tokenRequest;
+}
+
+/**
+ * Publish a per-user invalidation/notification signal.
+ *
+ * Platform clients subscribe via the existing /api/zero/realtime/token
+ * endpoint and receive events published by the API backend.
+ *
+ * NOT best-effort: rejections from Ably propagate to the caller, matching
+ * the original route behaviour. Mutation handlers should use this directly; if
+ * a non-blocking publish becomes necessary for a future route, prefer
+ * `settle` from ../utils.
+ */
+export async function publishUserSignal(
+  userIds: readonly string[],
+  topic: string,
+  payload: unknown = null,
+): Promise<void> {
+  const client = ablyClient();
+  await Promise.all(
+    userIds.map(async (userId) => {
+      const channel = client.channels.get(getUserChannelName(userId));
+      await channel.publish(topic, payload);
+    }),
+  );
+  L.debug(`Published "${topic}" to ${userIds.length} user(s)`);
+}
+
+export async function publishRunChangedForUserSafely(
+  userId: string,
+  runId: string,
+  payload: unknown = null,
+): Promise<void> {
+  await tapError(
+    publishUserSignal([userId], `run:changed:${runId}`, payload),
+    (error) => {
+      L.warn("Failed to publish run changed signal", { runId, error });
+    },
+  );
+}
+
+/**
+ * Fire the user-level "thread list shape changed" signal. The sidebar
+ * subscribes to this topic and reloads the full list on any delivery —
+ * payload is intentionally empty because the server is authoritative and
+ * the client already has a cheap list endpoint to re-fetch.
+ */
+export async function publishThreadListChanged(userId: string): Promise<void> {
+  await publishUserSignal([userId], "threadListChanged");
+}
+
+/**
+ * Notify a chat thread's UI that a new message row was appended. The thread's
+ * message data source subscribes to this topic and refetches, so derived state
+ * (e.g. the composer's folded goal state) updates live.
+ *
+ * Best-effort: a failed publish must not fail the mutation that triggered it.
+ */
+export async function publishChatThreadMessageCreatedSafely(
+  userId: string,
+  threadId: string,
+): Promise<void> {
+  await tapError(
+    publishUserSignal([userId], `chatThreadMessageCreated:${threadId}`),
+    (error) => {
+      L.warn("Failed to publish chat thread message created signal", {
+        threadId,
+        error,
+      });
+    },
+  );
+}
+
+/**
+ * Notify a chat thread's UI that an existing message row changed in place.
+ * The payload lets clients refetch that exact row instead of relying on the
+ * append-only message cursor, which cannot observe updates to an older row.
+ */
+export async function publishChatThreadMessageUpdated(
+  userId: string,
+  threadId: string,
+  messageId: string,
+): Promise<void> {
+  await publishUserSignal([userId], `chatThreadMessageUpdated:${threadId}`, {
+    messageId,
+  });
+}
+
+/**
+ * Notify a chat thread's UI that its linked automation set changed (created,
+ * deleted, enabled, or disabled). The chat-thread header automation menu
+ * subscribes to this topic and refetches its thread-scoped list.
+ *
+ * Best-effort: a failed publish must not fail the automation mutation that
+ * triggers it. Payload is intentionally empty — the client re-fetches the
+ * authoritative list on any delivery.
+ */
+export async function publishChatThreadAutomationsChangedSafely(
+  userId: string,
+  threadId: string,
+): Promise<void> {
+  await tapError(
+    publishUserSignal([userId], `chatThreadAutomationsChanged:${threadId}`),
+    (error) => {
+      L.warn("Failed to publish chat thread automations changed signal", {
+        threadId,
+        error,
+      });
+    },
+  );
+}
+
+/**
+ * Notify a chat thread's UI that its visible workflow set changed. The slash
+ * workflow composer subscribes to this topic and refetches the authoritative
+ * agent-scoped workflow list.
+ *
+ * Best-effort: a failed publish must not fail the workflow mutation that
+ * triggers it.
+ */
+export async function publishChatThreadWorkflowsChangedSafely(
+  userId: string,
+  threadId: string,
+): Promise<void> {
+  await tapError(
+    publishUserSignal([userId], `chatThreadWorkflowsChanged:${threadId}`),
+    (error) => {
+      L.warn("Failed to publish chat thread workflows changed signal", {
+        threadId,
+        error,
+      });
+    },
+  );
+}
+
+/**
+ * Notify a chat thread's UI that its workflow queue changed (event enqueued,
+ * drained, skipped, cleared, paused, or resumed). Best-effort like the
+ * automations signal: a failed publish must not fail the mutation. The client
+ * re-fetches the authoritative queue state on any delivery.
+ */
+export async function publishChatThreadWorkflowQueueChangedSafely(
+  userId: string,
+  threadId: string,
+): Promise<void> {
+  await tapError(
+    publishUserSignal([userId], `chatThreadWorkflowQueueChanged:${threadId}`),
+    (error) => {
+      L.warn("Failed to publish chat thread workflow queue changed signal", {
+        threadId,
+        error,
+      });
+    },
+  );
+}
+
+export async function publishBuiltInGenerationChanged(
+  userId: string,
+  generationId: string,
+  payload: unknown,
+): Promise<void> {
+  await publishUserSignal(
+    [userId],
+    getBuiltInGenerationEventName(generationId),
+    payload,
+  );
+}
+
+/**
+ * Publish an org-scoped signal. Used for events that any org member's UI
+ * may want to see (e.g. queue:changed when a run cancels and a queued
+ * run becomes eligible to dispatch).
+ */
+export async function publishOrgSignal(
+  orgId: string,
+  topic: string,
+  payload: unknown = null,
+): Promise<void> {
+  const client = ablyClient();
+  const channel = client.channels.get(`org:${orgId}`);
+  await channel.publish(topic, payload);
+  L.debug(`Published "${topic}" to org:${orgId}`);
+}
+
+/**
+ * Notify a runner-group channel that a run should halt. The runner subscribes
+ * to its group's channel and aborts the matching run on receipt.
+ */
+export async function publishCancelToRunnerGroup(
+  group: string,
+  runId: string,
+): Promise<void> {
+  const client = ablyClient();
+  const channel = client.channels.get(`runner-group:${group}`);
+  await channel.publish("cancel", { runId });
+  L.debug(`Published cancel ${runId} to runner-group:${group}`);
+}
+
+export async function publishNetworkPolicyRefreshToRunnerGroup(
+  group: string,
+  runId: string,
+  connectorRef: string,
+): Promise<void> {
+  const channel = ablyClient().channels.get(`runner-group:${group}`);
+  await channel.publish("network-policy-refresh", { runId, connectorRef });
+  L.debug(
+    `Published network policy refresh ${runId}/${connectorRef} to runner-group:${group}`,
+  );
+}
+
+export async function publishRunnerJobNotification(
+  group: string,
+  runId: string,
+  profile: string,
+  metadata?: {
+    readonly cliAgentSessionId: string | null;
+    readonly historyGenerationAffinityProtectedUntil: string | null;
+    readonly affinityProtectedUntil: string | null;
+    readonly historyGenerationRunId: string | undefined;
+  },
+): Promise<boolean> {
+  const published = await tapError(
+    (async () => {
+      const channel = ablyClient().channels.get(`runner-group:${group}`);
+      await channel.publish("job", {
+        runId,
+        profile,
+        ...(metadata?.cliAgentSessionId
+          ? { cliAgentSessionId: metadata.cliAgentSessionId }
+          : {}),
+        ...(metadata?.affinityProtectedUntil
+          ? { affinityProtectedUntil: metadata.affinityProtectedUntil }
+          : {}),
+        ...(metadata?.historyGenerationAffinityProtectedUntil
+          ? {
+              historyGenerationAffinityProtectedUntil:
+                metadata.historyGenerationAffinityProtectedUntil,
+            }
+          : {}),
+        ...(metadata?.historyGenerationRunId
+          ? { historyGenerationRunId: metadata.historyGenerationRunId }
+          : {}),
+      });
+      L.debug(`Published job ${runId} to runner-group:${group} (broadcast)`);
+      return true;
+    })(),
+    (error) => {
+      L.warn("Failed to publish runner job notification", {
+        group,
+        runId,
+        error,
+      });
+    },
+  );
+  return published ?? false;
+}

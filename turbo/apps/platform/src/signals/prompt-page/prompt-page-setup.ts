@@ -1,0 +1,262 @@
+import { command } from "ccstate";
+import { isSupportedRunModel } from "@vm0/api-contracts/contracts/model-providers";
+import type { GenerationTemplateRequest } from "@vm0/api-contracts/contracts/chat-threads";
+import {
+  ILLUSTRATION_TEMPLATE_ITEMS,
+  PRESENTATION_TEMPLATE_PICKER_ITEMS,
+  findWebsiteTemplateItem,
+  findVideoTemplateItem,
+} from "@vm0/core";
+import { FeatureSwitchKey } from "@vm0/connectors/feature-switch-key";
+import { sendNewThread$ } from "../chat-page/optimistic-chat-thread-page.ts";
+import { updateDocumentTitle$ } from "../document-title.ts";
+import { featureSwitch$ } from "../external/feature-switch.ts";
+import { defaultAgentId$ } from "../agent.ts";
+import { rootSignal$ } from "../root-signal.ts";
+import { detachedNavigateTo$, searchParams$ } from "../route.ts";
+import { showAppSkeleton$ } from "../app-skeleton.ts";
+import {
+  onboardGuard$,
+  redirectToConfiguredOnboarding$,
+} from "../zero-page/onboard-guard.ts";
+import {
+  resetChatPageModelSelection$,
+  setChatPageModelSelection$,
+} from "../zero-page/zero-chat-page.ts";
+import { withCleanup } from "../utils.ts";
+
+function templateIdFromSearchParam(
+  template: string | null,
+): string | undefined {
+  const id = template?.trim();
+  if (!id) {
+    return undefined;
+  }
+  return id;
+}
+
+function legacyGenerationTemplateFromSearchParam(
+  template: string | null,
+): GenerationTemplateRequest | undefined {
+  const id = templateIdFromSearchParam(template);
+  if (!id) {
+    return undefined;
+  }
+  const videoTemplate = findVideoTemplateItem(id);
+  if (!videoTemplate) {
+    const presentationTemplateId = id.replace(/^presentation-template:/, "");
+    const presentationTemplate = PRESENTATION_TEMPLATE_PICKER_ITEMS.find(
+      (item) => {
+        return (
+          item.slug === presentationTemplateId ||
+          item.templateId === id ||
+          item.templateId === presentationTemplateId
+        );
+      },
+    );
+    if (!presentationTemplate) {
+      const illustrationTemplateId = id
+        .replace(/^illustration-template:/, "")
+        .replace(/^image-template:/, "");
+      const illustrationTemplate = ILLUSTRATION_TEMPLATE_ITEMS.find((item) => {
+        return (
+          item.slug === illustrationTemplateId ||
+          item.illustrationStyleId === id ||
+          item.illustrationStyleId === illustrationTemplateId
+        );
+      });
+      if (!illustrationTemplate) {
+        return undefined;
+      }
+      return {
+        type: "illustration",
+        selection: {
+          illustrationStyleId: illustrationTemplate.illustrationStyleId,
+        },
+      };
+    }
+    return {
+      type: "presentation",
+      selection: {
+        templateId: presentationTemplate.templateId,
+        colorSystemId:
+          presentationTemplate.colorSystemId ?? "color-system:warm-sand",
+        previewUrl: presentationTemplate.embedUrl,
+      },
+    };
+  }
+  return {
+    type: "video",
+    selection: { stylePresetId: videoTemplate.id },
+  };
+}
+
+function websiteGenerationTemplateFromId(
+  id: string,
+): GenerationTemplateRequest | undefined {
+  const websiteTemplate = findWebsiteTemplateItem(id);
+  if (!websiteTemplate) {
+    return undefined;
+  }
+  return {
+    type: "website",
+    selection: {
+      websiteTemplateId: websiteTemplate.id,
+    },
+  };
+}
+
+function videoGenerationTemplateFromId(
+  id: string,
+): GenerationTemplateRequest | undefined {
+  const videoTemplate = findVideoTemplateItem(id);
+  if (!videoTemplate) {
+    return undefined;
+  }
+  return {
+    type: "video",
+    selection: { stylePresetId: videoTemplate.id },
+  };
+}
+
+function presentationGenerationTemplateFromId(
+  id: string,
+): GenerationTemplateRequest | undefined {
+  const presentationTemplateId = id.replace(/^presentation-template:/, "");
+  const presentationTemplate = PRESENTATION_TEMPLATE_PICKER_ITEMS.find(
+    (item) => {
+      return (
+        item.slug === presentationTemplateId ||
+        item.templateId === id ||
+        item.templateId === presentationTemplateId
+      );
+    },
+  );
+  if (!presentationTemplate) {
+    return undefined;
+  }
+  return {
+    type: "presentation",
+    selection: {
+      templateId: presentationTemplate.templateId,
+      colorSystemId:
+        presentationTemplate.colorSystemId ?? "color-system:warm-sand",
+      previewUrl: presentationTemplate.embedUrl,
+    },
+  };
+}
+
+function illustrationGenerationTemplateFromId(
+  id: string,
+): GenerationTemplateRequest | undefined {
+  const illustrationTemplateId = id
+    .replace(/^illustration-template:/, "")
+    .replace(/^image-template:/, "");
+  const illustrationTemplate = ILLUSTRATION_TEMPLATE_ITEMS.find((item) => {
+    return (
+      item.slug === illustrationTemplateId ||
+      item.illustrationStyleId === id ||
+      item.illustrationStyleId === illustrationTemplateId
+    );
+  });
+  if (!illustrationTemplate) {
+    return undefined;
+  }
+  return {
+    type: "illustration",
+    selection: {
+      illustrationStyleId: illustrationTemplate.illustrationStyleId,
+    },
+  };
+}
+
+const generationTemplateParsers = [
+  websiteGenerationTemplateFromId,
+  videoGenerationTemplateFromId,
+  presentationGenerationTemplateFromId,
+  illustrationGenerationTemplateFromId,
+] as const;
+
+function generationTemplateFromSearchParam(
+  template: string | null,
+): GenerationTemplateRequest | undefined {
+  const id = templateIdFromSearchParam(template);
+  if (!id) {
+    return undefined;
+  }
+  for (const parse of generationTemplateParsers) {
+    const generationTemplate = parse(id);
+    if (generationTemplate) {
+      return generationTemplate;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Lightweight prompt deep-link endpoint.
+ *
+ * This replaces the use-case-only `/onboarding?prompt=...` path once the
+ * workspace/default agent already exists: consume the prompt exactly like the
+ * onboarding "Try It" action and route into the new optimistic chat thread.
+ */
+export const setupPromptPage$ = command(
+  async ({ get, set }, signal: AbortSignal) => {
+    set(updateDocumentTitle$, "Prompt");
+    set(showAppSkeleton$);
+
+    const params = get(searchParams$);
+    const prompt = params.get("prompt")?.trim();
+    const requestedModel = params.get("model")?.trim();
+    const template = params.get("template");
+    const generationTemplate = get(featureSwitch$)[
+      FeatureSwitchKey.WebsiteTemplates
+    ]
+      ? generationTemplateFromSearchParam(template)
+      : legacyGenerationTemplateFromSearchParam(template);
+    if (!prompt) {
+      set(detachedNavigateTo$, "/", { replace: true });
+      return;
+    }
+
+    if (await set(onboardGuard$, signal)) {
+      return;
+    }
+
+    const agentId = await get(defaultAgentId$);
+    signal.throwIfAborted();
+    if (!agentId) {
+      await set(redirectToConfiguredOnboarding$, params, signal);
+      return;
+    }
+
+    if (isSupportedRunModel(requestedModel)) {
+      set(setChatPageModelSelection$, { selectedModel: requestedModel });
+    } else {
+      set(resetChatPageModelSelection$);
+    }
+
+    const cleaned = new URLSearchParams(params);
+    cleaned.delete("prompt");
+    cleaned.delete("model");
+    cleaned.delete("template");
+    cleaned.delete("connector");
+    const rootSignal = get(rootSignal$);
+    await withCleanup(
+      set(
+        sendNewThread$,
+        {
+          agentId,
+          prompt,
+          generationTemplate,
+          computerUseHostId: null,
+          routeSearchParams: cleaned,
+        },
+        rootSignal,
+      ),
+      () => {
+        set(resetChatPageModelSelection$);
+      },
+    );
+  },
+);

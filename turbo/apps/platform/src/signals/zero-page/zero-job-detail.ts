@@ -1,0 +1,18 @@
+export {
+  agentActiveTab$,
+  setAgentActiveTab$,
+  agentDetail$,
+  agentInstructions$,
+  agentEditedContent$,
+  agentInstructionsDirty$,
+  setAgentEditedContent$,
+  discardAgentEdit$,
+  buildAgentInstructions$,
+  updateAgentSettings$,
+  agentAuthorizedConnectors$,
+  authorizeAgentConnector$,
+  deauthorizeAgentConnector$,
+  saveAgentConnectors$,
+  deleteAgent$,
+  setActiveAgent$,
+} from "./job-detail/index.ts";

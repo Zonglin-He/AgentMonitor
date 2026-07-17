@@ -1,0 +1,123 @@
+import { command, computed, state } from "ccstate";
+import { toast } from "@vm0/ui/components/ui/sonner";
+import {
+  MODEL_PROVIDER_TYPES,
+  type ModelProviderType,
+} from "@vm0/api-contracts/contracts/model-providers";
+import {
+  deletePersonalModelProvider$,
+  personalModelProviders$,
+  resetPersonalCodexSubscriptionUsage$ as resetPersonalCodexSubscriptionUsageRequest$,
+} from "../../external/personal-model-providers.ts";
+
+// ---------------------------------------------------------------------------
+// Action promise (loading state)
+// ---------------------------------------------------------------------------
+
+const internalPersonalActionPromise$ = state<Promise<unknown> | null>(null);
+const internalSettingsCodexResetDialog$ = state({
+  open: false,
+  resetCredits: null as number | null,
+});
+const internalAccountMenuCodexResetDialog$ = state({
+  open: false,
+  resetCredits: null as number | null,
+});
+
+export const personalActionPromise$ = computed((get) => {
+  return get(internalPersonalActionPromise$);
+});
+
+export const settingsCodexResetDialog$ = computed((get) => {
+  return get(internalSettingsCodexResetDialog$);
+});
+
+export const accountMenuCodexResetDialog$ = computed((get) => {
+  return get(internalAccountMenuCodexResetDialog$);
+});
+
+export const setSettingsCodexResetDialog$ = command(
+  ({ set }, dialog: { open: boolean; resetCredits: number | null }) => {
+    set(internalSettingsCodexResetDialog$, dialog);
+  },
+);
+
+export const setAccountMenuCodexResetDialog$ = command(
+  ({ set }, dialog: { open: boolean; resetCredits: number | null }) => {
+    set(internalAccountMenuCodexResetDialog$, dialog);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Derived state
+// ---------------------------------------------------------------------------
+
+export const personalConfiguredProviders$ = computed(async (get) => {
+  const { modelProviders } = await get(personalModelProviders$);
+  return [...modelProviders].sort((a, b) => {
+    return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+  });
+});
+
+export const disconnectPersonalOAuthCredential$ = command(
+  async ({ set }, providerType: ModelProviderType, signal: AbortSignal) => {
+    const providerLabel =
+      MODEL_PROVIDER_TYPES[providerType]?.label ?? providerType;
+
+    const promise = (async () => {
+      await set(deletePersonalModelProvider$, providerType, signal);
+      signal.throwIfAborted();
+      toast.success(`${providerLabel} disconnected`);
+    })();
+
+    set(internalPersonalActionPromise$, promise);
+    signal.addEventListener("abort", () => {
+      set(internalPersonalActionPromise$, null);
+    });
+
+    await promise;
+    signal.throwIfAborted();
+  },
+);
+
+export const resetPersonalCodexSubscriptionUsage$ = command(
+  async ({ set }, signal: AbortSignal) => {
+    const promise = (async () => {
+      const result = await set(
+        resetPersonalCodexSubscriptionUsageRequest$,
+        {
+          idempotencyKey: crypto.randomUUID(),
+        },
+        signal,
+      );
+      signal.throwIfAborted();
+
+      switch (result.outcome) {
+        case "reset": {
+          toast.success("Codex usage reset");
+          break;
+        }
+        case "nothingToReset": {
+          toast.info("Codex usage does not need a reset right now");
+          break;
+        }
+        case "noCredit": {
+          toast.error("No Codex usage resets available");
+          break;
+        }
+        case "alreadyRedeemed": {
+          toast.success("Codex usage reset");
+          break;
+        }
+      }
+    })();
+
+    set(internalPersonalActionPromise$, promise);
+    signal.addEventListener("abort", () => {
+      set(internalPersonalActionPromise$, null);
+    });
+
+    await promise;
+    signal.throwIfAborted();
+  },
+);

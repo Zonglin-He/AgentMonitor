@@ -1,0 +1,392 @@
+import { computed } from "ccstate";
+import { registryResourceDownloadContract } from "@vm0/api-contracts/contracts/registry-resources";
+import {
+  findColorSystem,
+  findDesignSystem,
+  findImageStyle,
+  findPresentationRunbookResource,
+  findSkill,
+  findTemplate,
+  findTool,
+  findVideoTemplate,
+  findWebsiteTemplateResource,
+  type RegistryEntry,
+  type VideoTemplateRegistryEntry,
+} from "@vm0/core/resource-registry";
+import { storages, storageVersions } from "@vm0/db/schema/storage";
+import { and, eq } from "drizzle-orm";
+
+import { env } from "../../lib/env";
+import { notFound } from "../../lib/error";
+import { authRoute } from "../auth/auth-route";
+import { queryOf } from "../context/request";
+import { db$ } from "../external/db";
+import { generatePresignedGetUrl } from "../external/s3";
+import type { RouteEntry } from "../route-entry";
+
+type PullableRegistryEntry = RegistryEntry | VideoTemplateRegistryEntry;
+
+interface PrivateRegistryResourceArchive {
+  readonly storageName: string;
+  readonly versionId: string;
+  readonly sha256: string;
+}
+
+const DOWNLOAD_URL_TTL_SECONDS = 900;
+
+function storageServiceNotConfigured() {
+  return {
+    status: 500 as const,
+    body: {
+      error: {
+        message: "Storage service is not properly configured",
+        code: "INTERNAL_ERROR" as const,
+      },
+    },
+  };
+}
+
+const PRIVATE_REGISTRY_RESOURCE_ARCHIVE_VERSION_IDS = {
+  "color-system:bauhaus-primary":
+    "26c34a2a33a5c7b751b6741da5e4013020d5dbe138e60f5b3a444f4a5d3a351b",
+  "color-system:berry-pop":
+    "a9e00d18e3042262affb0d1396bd010aa8fa548f6b89e8ae1d634aec37a955b7",
+  "color-system:carnival":
+    "112848d050081ddca2d8ffc57a685906998a7073ddd7585cc4d94f9060b439b8",
+  "color-system:citrus-fresh":
+    "556f9d77f9aa835475b423639e8d642f6e63d5c66f7a4b5b954a37c058292b30",
+  "color-system:coral-studio":
+    "15103787a715de87210ed905a7e35e76694a7a33f3c1a2d734ea54239fba1280",
+  "color-system:forest-editorial":
+    "24cc3c0b4062114e877221d0f50bde4de00c90838d7a54f6013c9038bdd2e19d",
+  "color-system:gold-luxe":
+    "b4c5af7c9bddc8ef1e47d681fadd678852f3b4dc7a9eafd749eca54ba60acbe7",
+  "color-system:mauve-dusk":
+    "181f5d2ee8dfd765563b891693dc145f77a313013f788c799bfefadc231bbcf8",
+  "color-system:midnight-mono":
+    "a9cfc3533f23d04b48e7270a45f4577c5e055509bad35118a23a14ad8c52345b",
+  "color-system:mint-tech":
+    "19bf57aae59ef94b0cb18dcfed6d5ab6d55b3d38f7196c704e9301351820db8d",
+  "color-system:mono-ink":
+    "cc135f036e03e30773d2e01739ed93e0b578f501f44019114e4674bd6a05d932",
+  "color-system:nordic-frost":
+    "a1b0f1018d46dabfb004c933f6a557b43498e8c957e8d5fe1375ab8d1699a9aa",
+  "color-system:ocean-deep":
+    "c848d3aac65c0c9a8f749c61a5aad5f634cf5d7d75d78f1080a45530d3bfdc78",
+  "color-system:pop-art":
+    "82d9330442d86f9969748acf12fd964e9999cad0089b441f57df708cf43ccf79",
+  "color-system:prism":
+    "45c23078172e802ed40e81922b072407bb6a19bf839d5e5be2431d30cc9190c9",
+  "color-system:slate-corporate":
+    "c082c9a8e96aa2c29720e8b06eb827d56f10b0fa5db05112f65cd3a251b65b49",
+  "color-system:sunset-maroon":
+    "d2bde0b6b2dc8d23342040458315eab71fedebdfc4e278ca1de7255eeac6b7e0",
+  "color-system:terracotta-clay":
+    "f23a7edd4705fcf7b8086da55553a601194bcd857be15de7072128ff916a03ad",
+  "color-system:warm-sand":
+    "e9ea329a25491e347cb3c1156735201a4ff7f8a299dd8990b024d31854b49050",
+  // Presentation runbook packages (self-contained per-template archives).
+  "template:html-ppt-playful-launch-runbook":
+    "1c46e7d953de0ea47924b9e9936433d7ede1d21ac595f62cbcdee160bded6c26",
+  "template:html-ppt-bloom-pitch-runbook":
+    "a7c6805b134a3892ac46e8aa4c89ab319ca6f58ac283c0aeb8de645eb88ba5ae",
+  "template:html-ppt-blueprint-academy-runbook":
+    "69536f28d581fced0512e5f61195b32aa4e80a260f14e953abb9710c17d7aef3",
+  "template:html-ppt-botane-organic-runbook":
+    "9c5886408f471e4939e8d17e75ab085647ca4fb6d4f0b8f878ea52fd3138f1f8",
+  "template:html-ppt-business-data-runbook":
+    "708cfa85ffc746c400e8200d248fd3674c1b41d955a19c5d29c76b55e12c2ae9",
+  "template:html-ppt-crayon-runbook":
+    "dfaf1f0bce54497e476e51923495d6a8d7be46c895c1b62f784910d876e2ddba",
+  "template:html-ppt-creative-agency-runbook":
+    "543d15a486b8b4dd588ae3f5a75b363b62e4f9cef12254f6b21c3eeb6075739f",
+  "template:html-ppt-data-report-runbook":
+    "9153793baa7a1fbd114faafdde113292b2fea124471a905b7347eb53400de413",
+  "template:html-ppt-editorial-magazine-runbook":
+    "c76af4a6b696bae7afb35b5909188553d766b1f2a49212c55ff22e7e0f99a4a6",
+  "template:html-ppt-landing-consulting-runbook":
+    "1fe914f9ba1438deb3ebab86c17721474eada19243e08d4769954fde5d16e830",
+  "template:html-ppt-lumina-runbook":
+    "b3f4732414f67862b0aa17415b2af0d5bdd92fd4779b386964efa59402409fa0",
+  "template:html-ppt-meridian-runbook":
+    "d67ea5a3225c96289327bc64ec76e37e4e66bbbc977d212d8e046d42387ca81d",
+  "template:html-ppt-mosaic-geometric-runbook":
+    "5f3a99097a5e7fdf3f206e537f5af156aa73c2f9af0ff8a2d6d70336c074d550",
+  "template:html-ppt-neo-brutalism-runbook":
+    "364c85728bd3965c78a8126da2c756930bfcec0999145774efff4b3b67a4dc62",
+  "template:html-ppt-nocturne-runbook":
+    "f713d74d5845a39bbdac672ff47baa3558d3e5e248465dd644ba951322445aab",
+  "template:html-ppt-pixel-glitch-runbook":
+    "c966b28b3024528e99c814c0fef998d1331294472a3ee2c3dccc7f68ba76b33d",
+  "template:html-ppt-playful-pop-runbook":
+    "a9e31045b0eebe35b32d3d22f2d866d45394d79b99e805e2cae03fcb04282cc0",
+  "template:html-ppt-prospectus-runbook":
+    "69e3c21d3ff27ebdd5ee6079e2809e9f7e7a0a1d6ba673349d957a961798f36b",
+  "template:html-ppt-schoolhouse-runbook":
+    "a34ed3483769cc2825656849385b86f23c50e5500d8ab20e7a705019949e49a5",
+  "template:html-ppt-sticker-scrapbook-runbook":
+    "3b8eae68d6ff1dbb90396b0e929e9adc88dcb8c1850a6e7dbf13b650beb279bc",
+  "template:html-ppt-strata-runbook":
+    "480717095fda024858014262a77e95344cf2f2f319603eb3f295662bc3ec43cc",
+  "template:html-ppt-taped-consulting-runbook":
+    "423c53c83c3f7a4b3ca9c6f9ce314b8bec4555cf2497a0fcc9fbd20c36a13acb",
+  "template:html-ppt-vantage-runbook":
+    "366c1c2028815fcb13b4c8798550ded9e0853cf55fd2df9124ab4327ff012362",
+  // Website template packages (self-contained per-template archives).
+  "template:black-slabs":
+    "eaca342df50857477c64a1ca73faffb4a1819879948fc8610ff095fae9fe3f22",
+  "template:blueprint-grid":
+    "78988a658604a25feb259d54e4543bfe6d57f85efe7ad67737e02c794d25e491",
+  "template:coastal-hotel":
+    "3907cdbed6078702a058ed9c66c1cdeb76f83f1062efcf3b046cce0bd5c8ed06",
+  "template:dot-matrix":
+    "293a2bc33150ca1f39132a8235c5cf355944e8d3e213b5f7703237314a2ac449",
+  "template:frame-stack":
+    "efbf1788c8b084aa12b7cd48f7a3bf5fc9964d1e6115edbd9124f8cacfbfb3ca",
+  "template:frosted-scatter":
+    "c4507fd54d252dc905df36d99f23ab65a4d41185b78e62515ff3eb3d87a381a4",
+  "template:gallery-wall":
+    "9e81cd8b35f9f6374440cd3a4a8fc214db4a137962797df69bde46248c4e75f3",
+  "template:glass-bloom":
+    "52d38ebc1e62b974f7ab2f6dba8823b0a2f7c43d5c11d8079f32e3ff85df1e50",
+  "template:serif-stack":
+    "adee3b87f670c52a3cc4971e5dd8795f8ca05690087caff4b0d8b32b9029bead",
+  "template:sticker-pop":
+    "ddae2ff9236b0a4663dc19ad23b374488c0d4d9eddf9b5a4e8cad36011b0b420",
+  "template:warm-cards":
+    "0a87c99afe9cf24424aa1a1740a57cc3698e43f3c571b8ef1fd4560192f38746",
+} as const satisfies Record<string, string>;
+
+// Keep the default archive version for already released CLIs. Newer CLIs opt
+// into these refreshed presentation packages by sending their expected digest.
+// This prevents a backend-only deployment from breaking existing CLI users.
+const PRESENTATION_RUNBOOK_ARCHIVE_VERSION_IDS_BY_SHA256 = {
+  "template:html-ppt-blueprint-academy-runbook": {
+    d6f16dff7c2f7830b71a3d6ed3fd228f1de7a29fa7795e2a31afb9fc841a0f72:
+      "04d537e1a2dce0874d8be914e90884b756a0f14e30589b6e805b23110d3c698e",
+  },
+  "template:html-ppt-botane-organic-runbook": {
+    "052c937dc4a9c6e7c528265d86210c15488b19710d22437b25fb1710853c8a6f":
+      "28ad523a1663716dfe740d9c4b37160a386fd40f78fc61597b35be9c348fe023",
+  },
+  "template:html-ppt-business-data-runbook": {
+    c3ca2128d7dbfb2e683bb0386d5335505c1f540160481da1c97aae9ff52a15ac:
+      "edbb8ebe65957687641e1a573b64ad49dc6a9de462c4e46d510d154c5eb60f19",
+  },
+  "template:html-ppt-crayon-runbook": {
+    "1e698ca42b7a36dfa8a1ed6f45c2b25181bf1058c91207b934612a73701fae70":
+      "c8d9c8f02e70819968fb78c04a70a6e537601e9a86667fd57b3cba4e8825efb4",
+  },
+  "template:html-ppt-creative-agency-runbook": {
+    "7c3b33353bd22b2a6dc0c50c7ed9d3d97b159199ad30aa61b2abeb46a931b6ec":
+      "ce79d73e31cb5acbfe55479e8c1629ba68f7548b477709d98057ee8675b26867",
+  },
+  "template:html-ppt-data-report-runbook": {
+    "11747371adb6561e25cd4c3095caf62f52840c4ee625d234478f7631b746a9b3":
+      "63302cec8a67a5179c9ba6309f267a62f4ee15b3e8403a5515821d23916c40c2",
+  },
+  "template:html-ppt-editorial-magazine-runbook": {
+    d1ae6492925d2e9ed7cc0acc1684c33fea6613b6bef34b21aa228f01fc76c5d7:
+      "cc0fd39023d6f920ae5dcae7a2dce3c176d1fd34392b35818f5bd2677e81f874",
+  },
+  "template:html-ppt-landing-consulting-runbook": {
+    "3b2fa8e03ebe9bdd8397bfa4fdf526e9f10b11d2b1676829f7b32eeaa8336cf8":
+      "e027d3b085d2151bb72bd4b3f535dfa1130fb00321e15821d3125eadad22bffa",
+    "01323dcebc9413781ad518d86f6b6611c3fb39a8bfd6287b2abced7c9432b6c7":
+      "fc15dfea6f7dda89180e837843cc1dfbcdbe14b70361d39ef902a2d8ad42472c",
+  },
+  "template:html-ppt-lumina-runbook": {
+    "38ae1652ababd62fbb2dcbc612a7a9458dae0b88283e09b34d113882f94ca063":
+      "f36f3076811cf916762b1a24f9e44a209a0daa58efad275f5da32ed5dae700cc",
+  },
+  "template:html-ppt-meridian-runbook": {
+    "6d31c74008ea8f854da929edb135ecbc8410dc3790e9c5ff8d43681029c1ecff":
+      "b1af398afe34a0625f0fd08e97444ac77c26ffb218ec62c315fe338558fb9133",
+  },
+  "template:html-ppt-mosaic-geometric-runbook": {
+    e9e489d2bcd817968c30ebae6b41513e3e175c58fd7a1db36351918ff45e1576:
+      "8e2ec2d02439606a525c36257db38c32d026953d75f9fd55c64fbaef482fe8ea",
+    fd036b42ef323011f0a2c771ceb0bbc6cfb6fb29272633f4e187cd672a89d336:
+      "0e11dc5bccb9abfa9d008c117aaf14908b363d20613bfbb57cab6267c90e90a5",
+  },
+  "template:html-ppt-neo-brutalism-runbook": {
+    "70ca020b00cd79abdb471e3145f2bd706c1a2978fdd5870e372565033f3a4ead":
+      "6b3fb7b9eabb60d76d37f40b86a71f95682fcbca08ce1c331f899f6e72c95239",
+  },
+  "template:html-ppt-nocturne-runbook": {
+    efd5031c618ea76fa20d460f583c69c086459a965e006e38ef189390fe1692a6:
+      "eab50c15e578fce0dabdbbd1b2de11fa1c1b36596622157f7f142d8d2212c9cd",
+    "83d26dbd95a839310db7553b3a2e4dfe2cc3d9678d988fa864d4dd61f6941213":
+      "ec30051e82c3d7cc903bc3bc9b7b1b3b5d94d134e897ede0f4b6e5f2a4a0dc8f",
+  },
+  "template:html-ppt-pixel-glitch-runbook": {
+    bf3f5312f2281490f592c8d1c02477e57632299ea93b9e3eef65fe1dc2236e29:
+      "958d5fe6f53598ff3cb920fe6dd91433b16a4eb5cbfb10fb179ae98b15765cce",
+  },
+  "template:html-ppt-playful-launch-runbook": {
+    "78292a9a5c454e36a5255f22d147ac56f53c69538a4ac0897160239c2ca941e3":
+      "6a81763e63f55e2fe446957fccd8bf770d02efe6d613b1fc988fc206b697d511",
+    "9c7524540e98a3605b71a35c918d1a186d9599f34f9e67aa8c86c457dc6b4582":
+      "6bbcb6decd53b667eb4aae4f79b05b10eb487fd83496265105d5b4c47542c9aa",
+  },
+  "template:html-ppt-playful-pop-runbook": {
+    "1c84b4a0df81a8ca169ac30a589410b8d846af5900c38d08fb77688b2556a565":
+      "9625d8a2ba670cbeac3be21469c07ca90841c1d45defc0c1de674cf2e1e3d7f8",
+  },
+  "template:html-ppt-prospectus-runbook": {
+    "0dc2b86b15970312003f6a60a90b03c47729870a38f85ae79c89547cd1cb485d":
+      "a6ec614912182e6ace467ff0c96036f263cab8030d01146b414af5996e9f278c",
+  },
+  "template:html-ppt-schoolhouse-runbook": {
+    bb3e49899d1bcd24b1e88ba8566a9ddd09039502fb51becffcd9f35051463e63:
+      "d792e4b858ac0ffeb0e0f4073730453d9753c9e654bdc671f7b2e94d6a40bd17",
+    "44e95a44ac37174b6dec3e2a2b21c0fe7d6d9f83c254d86cff1779030d5b11ad":
+      "c063961c29369b15b8ae7a3cb285105bc29dbae84cccc36d458b666a5ca75e06",
+  },
+  "template:html-ppt-sticker-scrapbook-runbook": {
+    f59e1ee3e70b6ca220e584bf230749ef8768941fcdf7873f4704d6f02ad72c73:
+      "1e0571aa497862d02c00067875cf213ee1b3c4b7d34b78877f21bf66e1dd54b3",
+    cddd7f14573af6aa922b2873658dc81fbcd45dfb42b84da8be9b8e0866874dab:
+      "4876f30e79ac5a035b79e210b0e2a99c4e989bba9c38f3b0ff046b4f56f857bc",
+  },
+  "template:html-ppt-strata-runbook": {
+    c91074decc1642d5c17644aa2aac43702dc727220046807e8f29db1eb47bd450:
+      "358d4479fb2bb312a0dad0eb4a9f4b9fdae1037e2f46554535ce8425b12a3cd0",
+    "39ebdffe9de88faebb6427d734927b57ebe69b9b98db5efbee59b5f7ab120cc6":
+      "56e7d344c982b946fc578d026ac8fbe1ee0ffe50d096be94cb25418bfa6fbd3a",
+  },
+  "template:html-ppt-taped-consulting-runbook": {
+    "7b05540c82b410abd1f236ef8a42ff53601489a4a8531413983830d42cec614b":
+      "f80b9966e449e3e0c07bf6f7d21c73c09f164fd2e144fdbb61c9aa59f2e138c6",
+  },
+  "template:html-ppt-vantage-runbook": {
+    "096678c9f5bc1760b9f2c25bf10949296ddaa98511a2ecae2bc59528bd7969ed":
+      "0172780a5797b6162eeb081390042289b80bcdc4ecf237142d3c89b830160381",
+  },
+} as const satisfies Readonly<Record<string, Readonly<Record<string, string>>>>;
+
+export function resolvePrivateRegistryResourceArchive(
+  id: string,
+  expectedSha256: string | undefined,
+  defaultSha256: string,
+): PrivateRegistryResourceArchive | undefined {
+  const defaultVersionId =
+    PRIVATE_REGISTRY_RESOURCE_ARCHIVE_VERSION_IDS[
+      id as keyof typeof PRIVATE_REGISTRY_RESOURCE_ARCHIVE_VERSION_IDS
+    ];
+  if (!defaultVersionId) {
+    return undefined;
+  }
+
+  const requestedVersionId = expectedSha256
+    ? (
+        PRESENTATION_RUNBOOK_ARCHIVE_VERSION_IDS_BY_SHA256 as Readonly<
+          Record<string, Readonly<Record<string, string>>>
+        >
+      )[id]?.[expectedSha256]
+    : undefined;
+
+  return {
+    storageName: `registry-resource@${id}`,
+    versionId: requestedVersionId ?? defaultVersionId,
+    sha256:
+      requestedVersionId && expectedSha256 ? expectedSha256 : defaultSha256,
+  };
+}
+
+function findRegistryResource(id: string): PullableRegistryEntry | undefined {
+  return (
+    findSkill(id) ??
+    findTool(id) ??
+    findTemplate(id) ??
+    findDesignSystem(id) ??
+    findColorSystem(id) ??
+    findImageStyle(id) ??
+    findVideoTemplate(id) ??
+    findPresentationRunbookResource(id) ??
+    findWebsiteTemplateResource(id)
+  );
+}
+
+function archiveFilename(id: string): string {
+  return `${id.replace(/[^a-zA-Z0-9._-]/g, "-")}.tar.gz`;
+}
+
+const downloadRegistryResourceInner$ = computed(async (get) => {
+  const query = get(queryOf(registryResourceDownloadContract.download));
+  const entry = findRegistryResource(query.id);
+  const archive = entry?.source.archive;
+  if (!entry || !archive) {
+    return notFound(`Registry resource "${query.id}" has no archive source`);
+  }
+
+  const privateArchive = resolvePrivateRegistryResourceArchive(
+    query.id,
+    query.expectedSha256,
+    archive.sha256,
+  );
+  if (!privateArchive) {
+    return notFound(`Registry resource "${query.id}" is not private-pullable`);
+  }
+
+  const db = get(db$);
+  const [version] = await db
+    .select({
+      s3Key: storageVersions.s3Key,
+      fileCount: storageVersions.fileCount,
+      size: storageVersions.size,
+    })
+    .from(storageVersions)
+    .innerJoin(storages, eq(storages.id, storageVersions.storageId))
+    .where(
+      and(
+        eq(storages.name, privateArchive.storageName),
+        eq(storages.type, "volume"),
+        eq(storageVersions.id, privateArchive.versionId),
+      ),
+    )
+    .limit(1);
+
+  if (!version) {
+    return notFound(`Private archive for "${query.id}" was not found`);
+  }
+
+  const bucket = env("R2_USER_STORAGES_BUCKET_NAME");
+  if (!bucket) {
+    return storageServiceNotConfigured();
+  }
+
+  const url = await get(
+    generatePresignedGetUrl(
+      bucket,
+      `${version.s3Key}/archive.tar.gz`,
+      DOWNLOAD_URL_TTL_SECONDS,
+      archiveFilename(query.id),
+      true,
+    ),
+  );
+
+  return {
+    status: 200 as const,
+    body: {
+      url,
+      id: entry.id,
+      type: archive.type,
+      sha256: privateArchive.sha256,
+      expiresInSeconds: DOWNLOAD_URL_TTL_SECONDS,
+      versionId: privateArchive.versionId,
+      fileCount: version.fileCount,
+      size: Number(version.size),
+    },
+  };
+});
+
+export const registryResourceDownloadRoutes: readonly RouteEntry[] = [
+  {
+    route: registryResourceDownloadContract.download,
+    handler: authRoute(
+      { requiredCapability: "file:read" },
+      downloadRegistryResourceInner$,
+    ),
+  },
+];

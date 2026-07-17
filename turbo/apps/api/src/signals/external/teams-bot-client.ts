@@ -1,0 +1,1007 @@
+import { z } from "zod";
+
+import { env, optionalEnv } from "../../lib/env";
+import { safeJsonParse, safeUrlParse, settle } from "../utils";
+
+const BOT_FRAMEWORK_SCOPE = "https://api.botframework.com/.default";
+const MICROSOFT_GRAPH_SCOPE = "https://graph.microsoft.com/.default";
+const DEFAULT_MICROSOFT_GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0";
+
+const teamsTokenResponseSchema = z
+  .object({
+    access_token: z.string().min(1),
+    token_type: z.string().optional(),
+    expires_in: z.union([z.number(), z.string()]).optional(),
+  })
+  .passthrough();
+
+const teamsActivityResponseSchema = z
+  .object({
+    id: z.string().optional(),
+  })
+  .passthrough();
+
+const teamsConversationResponseSchema = z
+  .object({
+    id: z.string().min(1),
+  })
+  .passthrough();
+
+const teamsGraphIdentitySchema = z
+  .object({
+    id: z.string().nullable().optional(),
+    displayName: z.string().nullable().optional(),
+    userPrincipalName: z.string().nullable().optional(),
+    mail: z.string().nullable().optional(),
+  })
+  .passthrough();
+
+const teamsGraphAttachmentSchema = z
+  .object({
+    id: z.string().nullable().optional(),
+    contentType: z.string().nullable().optional(),
+    contentUrl: z.string().nullable().optional(),
+    name: z.string().nullable().optional(),
+    content: z.unknown().optional(),
+  })
+  .passthrough();
+
+const teamsGraphMentionSchema = z
+  .object({
+    id: z.number().optional(),
+    mentionText: z.string().nullable().optional(),
+    mentioned: z
+      .object({
+        user: teamsGraphIdentitySchema.nullable().optional(),
+        application: teamsGraphIdentitySchema.nullable().optional(),
+        device: teamsGraphIdentitySchema.nullable().optional(),
+      })
+      .nullable()
+      .optional(),
+  })
+  .passthrough();
+
+const teamsGraphMessageSchema = z
+  .object({
+    id: z.string().optional(),
+    createdDateTime: z.string().nullable().optional(),
+    messageType: z.string().nullable().optional(),
+    from: z
+      .object({
+        user: teamsGraphIdentitySchema.nullable().optional(),
+        application: teamsGraphIdentitySchema.nullable().optional(),
+        device: teamsGraphIdentitySchema.nullable().optional(),
+      })
+      .nullable()
+      .optional(),
+    body: z
+      .object({
+        content: z.string().nullable().optional(),
+        contentType: z.string().nullable().optional(),
+      })
+      .nullable()
+      .optional(),
+    attachments: z.array(teamsGraphAttachmentSchema).optional(),
+    mentions: z.array(teamsGraphMentionSchema).optional(),
+  })
+  .passthrough();
+
+const teamsGraphMessagesResponseSchema = z
+  .object({
+    value: z.array(teamsGraphMessageSchema),
+  })
+  .passthrough();
+
+const teamsGraphUserSchema = z
+  .object({
+    id: z.string().optional(),
+    displayName: z.string().nullable().optional(),
+    userPrincipalName: z.string().nullable().optional(),
+    mail: z.string().nullable().optional(),
+  })
+  .passthrough();
+
+type TeamsApiErrorResult = {
+  readonly kind: "teams-error";
+  readonly status: number;
+  readonly error: string;
+};
+
+type SendTeamsActivityResult =
+  | { readonly kind: "ok"; readonly activityId: string | undefined }
+  | TeamsApiErrorResult;
+
+type SendTeamsReactionResult = { readonly kind: "ok" } | TeamsApiErrorResult;
+
+type CreateTeamsConversationResult =
+  | { readonly kind: "ok"; readonly conversationId: string }
+  | TeamsApiErrorResult;
+
+type FetchTeamsGraphMessageResult =
+  | { readonly kind: "ok"; readonly message: TeamsGraphMessage }
+  | TeamsApiErrorResult;
+
+type FetchTeamsGraphMessagesResult =
+  | { readonly kind: "ok"; readonly messages: readonly TeamsGraphMessage[] }
+  | TeamsApiErrorResult;
+
+type FetchTeamsFileResult =
+  | { readonly kind: "ok"; readonly response: Response }
+  | TeamsApiErrorResult;
+
+export type TeamsGraphMessage = z.infer<typeof teamsGraphMessageSchema>;
+export type TeamsGraphAttachment = z.infer<typeof teamsGraphAttachmentSchema>;
+
+export interface TeamsGraphUserInfo {
+  readonly id: string;
+  readonly displayName: string | null;
+  readonly userPrincipalName: string | null;
+}
+
+interface TeamsBotCredentials {
+  readonly appId: string;
+  readonly appPassword: string;
+}
+
+export interface TeamsAdaptiveCard {
+  readonly type: "AdaptiveCard";
+  readonly version: string;
+  readonly body?: readonly Readonly<Record<string, unknown>>[];
+  readonly actions?: readonly Readonly<Record<string, unknown>>[];
+}
+
+interface TeamsAdaptiveCardAttachment {
+  readonly contentType: "application/vnd.microsoft.card.adaptive";
+  readonly content: TeamsAdaptiveCard;
+}
+
+interface TeamsFileAttachment {
+  readonly contentType: string;
+  readonly contentUrl?: string;
+  readonly name?: string;
+}
+
+type TeamsActivityAttachment =
+  | TeamsAdaptiveCardAttachment
+  | TeamsFileAttachment;
+
+export interface TeamsMentionEntity {
+  readonly type: "mention";
+  readonly text: string;
+  readonly mentioned: {
+    readonly id: string;
+    readonly name?: string;
+  };
+}
+
+interface TeamsActivityBody {
+  readonly type: "message" | "typing";
+  readonly text?: string;
+  readonly textFormat?: "markdown";
+  readonly summary?: string;
+  readonly replyToId?: string;
+  readonly entities?: readonly TeamsMentionEntity[];
+  readonly attachments?: readonly TeamsActivityAttachment[];
+  readonly channelData?: {
+    readonly tenant?: { readonly id: string };
+  };
+}
+
+interface TeamsConversationIdentity {
+  readonly id: string;
+  readonly name?: string;
+}
+
+interface TeamsCreateConversationBody {
+  readonly bot: TeamsConversationIdentity;
+  readonly members: readonly TeamsConversationIdentity[];
+  readonly isGroup: false;
+  readonly channelData: {
+    readonly tenant: { readonly id: string };
+  };
+}
+
+function isE2eTeamsMockEnabled(): boolean {
+  const flag = optionalEnv("E2E_TEAMS_MOCK_ENABLED");
+  return flag === "1" || flag === "true";
+}
+
+function teamsBotCredentials(): TeamsBotCredentials | undefined {
+  const appId = env("MICROSOFT_TEAMS_BOT_APP_ID");
+  const appPassword = env("MICROSOFT_TEAMS_BOT_APP_PASSWORD");
+  if (!appId || !appPassword) {
+    return isE2eTeamsMockEnabled()
+      ? {
+          appId: "e2e-teams-bot-app-id",
+          appPassword: "e2e-teams-bot-app-password",
+        }
+      : undefined;
+  }
+  return { appId, appPassword };
+}
+
+function tenantTokenUrl(tenantId: string): string {
+  return `https://login.microsoftonline.com/${encodeURIComponent(
+    tenantId,
+  )}/oauth2/v2.0/token`;
+}
+
+function e2eTeamsMockBaseUrl(): string | undefined {
+  const explicitBaseUrl = optionalEnv("TEAMS_MOCK_BASE_URL");
+  if (explicitBaseUrl) {
+    return explicitBaseUrl.replace(/\/+$/u, "");
+  }
+
+  const mockEnabled = isE2eTeamsMockEnabled();
+  if (!mockEnabled) {
+    return undefined;
+  }
+
+  const vercelUrl = optionalEnv("VERCEL_URL");
+  if (vercelUrl) {
+    return `https://${vercelUrl}/api/test/teams-mock`;
+  }
+
+  const apiBackendUrl = optionalEnv("VM0_API_BACKEND_URL");
+  if (apiBackendUrl) {
+    return `${apiBackendUrl.replace(/\/+$/u, "")}/api/test/teams-mock`;
+  }
+
+  throw new Error(
+    "E2E_TEAMS_MOCK_ENABLED=1 but VERCEL_URL and VM0_API_BACKEND_URL are unset; cannot redirect Microsoft Teams API traffic to the preview mock routes",
+  );
+}
+
+function e2eTeamsMockHeaders(): Record<string, string> {
+  if (!isE2eTeamsMockEnabled()) {
+    return {};
+  }
+  const bypass = optionalEnv("VERCEL_AUTOMATION_BYPASS_SECRET");
+  if (!bypass) {
+    return {};
+  }
+  return {
+    "x-vercel-protection-bypass": bypass,
+    "x-vm0-test-endpoint-bypass": bypass,
+  };
+}
+
+function botTokenUrl(tenantId: string): string {
+  const configured = optionalEnv("MICROSOFT_TEAMS_BOT_TOKEN_URL");
+  if (configured) {
+    return configured;
+  }
+  const mockBaseUrl = e2eTeamsMockBaseUrl();
+  return mockBaseUrl ? `${mockBaseUrl}/token` : tenantTokenUrl(tenantId);
+}
+
+function graphTokenUrl(tenantId: string): string {
+  const configured = optionalEnv("MICROSOFT_TEAMS_GRAPH_TOKEN_URL");
+  if (configured) {
+    return configured;
+  }
+  const mockBaseUrl = e2eTeamsMockBaseUrl();
+  return mockBaseUrl ? `${mockBaseUrl}/token` : tenantTokenUrl(tenantId);
+}
+
+function graphBaseUrl(): string {
+  const configured = optionalEnv("MICROSOFT_GRAPH_BASE_URL");
+  if (configured) {
+    return configured.replace(/\/+$/u, "");
+  }
+  const mockBaseUrl = e2eTeamsMockBaseUrl();
+  return mockBaseUrl
+    ? `${mockBaseUrl}/graph`
+    : DEFAULT_MICROSOFT_GRAPH_BASE_URL;
+}
+
+function networkErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Network request failed";
+}
+
+function teamsApiError(status: number, error: string): TeamsApiErrorResult {
+  return { kind: "teams-error", status, error };
+}
+
+async function fetchClientCredentialsAccessToken(args: {
+  readonly tokenUrl: string;
+  readonly scope: string;
+  readonly signal: AbortSignal;
+}): Promise<
+  { readonly kind: "ok"; readonly accessToken: string } | TeamsApiErrorResult
+> {
+  const credentials = teamsBotCredentials();
+  if (!credentials) {
+    return teamsApiError(
+      502,
+      "Microsoft Teams bot credentials are not configured",
+    );
+  }
+
+  const body = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: credentials.appId,
+    client_secret: credentials.appPassword,
+    scope: args.scope,
+  });
+
+  const responseResult = await settle(
+    fetch(args.tokenUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        ...e2eTeamsMockHeaders(),
+      },
+      body,
+      signal: args.signal,
+    }),
+    args.signal,
+  );
+  if (!responseResult.ok) {
+    return teamsApiError(502, networkErrorMessage(responseResult.error));
+  }
+
+  const response = responseResult.value;
+  if (!response.ok) {
+    const text = await response.text();
+    args.signal.throwIfAborted();
+    return teamsApiError(
+      502,
+      text || `OAuth token request failed with HTTP ${response.status}`,
+    );
+  }
+
+  const parsed = teamsTokenResponseSchema.safeParse(
+    safeJsonParse(await response.text()),
+  );
+  args.signal.throwIfAborted();
+  if (!parsed.success) {
+    return teamsApiError(502, "Invalid OAuth token response");
+  }
+
+  return { kind: "ok", accessToken: parsed.data.access_token };
+}
+
+function fetchTeamsBotAccessToken(args: {
+  readonly tenantId: string;
+  readonly signal: AbortSignal;
+}): Promise<
+  { readonly kind: "ok"; readonly accessToken: string } | TeamsApiErrorResult
+> {
+  return fetchClientCredentialsAccessToken({
+    tokenUrl: botTokenUrl(args.tenantId),
+    scope: BOT_FRAMEWORK_SCOPE,
+    signal: args.signal,
+  });
+}
+
+function fetchTeamsGraphAccessToken(args: {
+  readonly tenantId: string;
+  readonly signal: AbortSignal;
+}): Promise<
+  { readonly kind: "ok"; readonly accessToken: string } | TeamsApiErrorResult
+> {
+  return fetchClientCredentialsAccessToken({
+    tokenUrl: graphTokenUrl(args.tenantId),
+    scope: MICROSOFT_GRAPH_SCOPE,
+    signal: args.signal,
+  });
+}
+
+function teamsConversationActivityUrl(args: {
+  readonly serviceUrl: string;
+  readonly conversationId: string;
+  readonly activityId: string | undefined;
+}): string | undefined {
+  const parsed = safeUrlParse(args.serviceUrl);
+  if (
+    !parsed ||
+    (parsed.protocol !== "https:" && parsed.protocol !== "http:")
+  ) {
+    return undefined;
+  }
+
+  const serviceUrl = parsed.href.replace(/\/+$/u, "");
+  const conversationId = encodeURIComponent(args.conversationId);
+  const base = `${serviceUrl}/v3/conversations/${conversationId}/activities`;
+  return args.activityId
+    ? `${base}/${encodeURIComponent(args.activityId)}`
+    : base;
+}
+
+function teamsConversationReactionUrl(args: {
+  readonly serviceUrl: string;
+  readonly conversationId: string;
+  readonly activityId: string;
+  readonly reactionType: string;
+}): string | undefined {
+  const activityUrl = teamsConversationActivityUrl({
+    serviceUrl: args.serviceUrl,
+    conversationId: args.conversationId,
+    activityId: args.activityId,
+  });
+  if (!activityUrl) {
+    return undefined;
+  }
+  return `${activityUrl}/reactions/${encodeURIComponent(args.reactionType)}`;
+}
+
+function teamsConversationsUrl(serviceUrl: string): string | undefined {
+  const parsed = safeUrlParse(serviceUrl);
+  if (
+    !parsed ||
+    (parsed.protocol !== "https:" && parsed.protocol !== "http:")
+  ) {
+    return undefined;
+  }
+
+  return `${parsed.href.replace(/\/+$/u, "")}/v3/conversations`;
+}
+
+function teamsGraphChannelMessageUrl(args: {
+  readonly teamId: string;
+  readonly channelId: string;
+  readonly messageId?: string;
+  readonly replies?: boolean;
+  readonly limit?: number;
+}): string {
+  const base = `${graphBaseUrl()}/teams/${encodeURIComponent(
+    args.teamId,
+  )}/channels/${encodeURIComponent(args.channelId)}/messages`;
+  const path = args.messageId
+    ? `${base}/${encodeURIComponent(args.messageId)}${
+        args.replies ? "/replies" : ""
+      }`
+    : base;
+  const url = new URL(path);
+  if (args.limit) {
+    url.searchParams.set("$top", String(args.limit));
+  }
+  return url.toString();
+}
+
+function teamsGraphUserUrl(userId: string): string {
+  const url = new URL(`${graphBaseUrl()}/users/${encodeURIComponent(userId)}`);
+  url.searchParams.set("$select", "id,displayName,userPrincipalName,mail");
+  return url.toString();
+}
+
+function shouldAuthorizeTeamsFileDownload(url: string): boolean {
+  const parsed = safeUrlParse(url);
+  if (!parsed) {
+    return false;
+  }
+  return (
+    parsed.hostname.toLowerCase().endsWith(".trafficmanager.net") &&
+    parsed.pathname.includes("/v3/attachments/")
+  );
+}
+
+async function fetchTeamsGraphJson<T>(args: {
+  readonly tenantId: string;
+  readonly url: string;
+  readonly schema: z.ZodType<T>;
+  readonly signal: AbortSignal;
+}): Promise<{ readonly kind: "ok"; readonly data: T } | TeamsApiErrorResult> {
+  const accessToken = await fetchTeamsGraphAccessToken({
+    tenantId: args.tenantId,
+    signal: args.signal,
+  });
+  if (accessToken.kind === "teams-error") {
+    return accessToken;
+  }
+
+  const responseResult = await settle(
+    fetch(args.url, {
+      method: "GET",
+      headers: {
+        authorization: `Bearer ${accessToken.accessToken}`,
+        ...e2eTeamsMockHeaders(),
+      },
+      signal: args.signal,
+    }),
+    args.signal,
+  );
+  if (!responseResult.ok) {
+    return teamsApiError(502, networkErrorMessage(responseResult.error));
+  }
+
+  const response = responseResult.value;
+  const responseText = await response.text();
+  args.signal.throwIfAborted();
+  if (!response.ok) {
+    return teamsApiError(
+      response.status,
+      responseText || `Microsoft Graph API returned HTTP ${response.status}`,
+    );
+  }
+
+  const parsed = args.schema.safeParse(safeJsonParse(responseText));
+  if (!parsed.success) {
+    return teamsApiError(502, "Invalid Microsoft Graph response");
+  }
+  return { kind: "ok", data: parsed.data };
+}
+
+export async function fetchTeamsFile(args: {
+  readonly tenantId: string;
+  readonly url: string;
+  readonly signal: AbortSignal;
+}): Promise<FetchTeamsFileResult> {
+  const headers: Record<string, string> = {
+    accept: "application/octet-stream",
+  };
+
+  if (shouldAuthorizeTeamsFileDownload(args.url)) {
+    const accessToken = await fetchTeamsBotAccessToken({
+      tenantId: args.tenantId,
+      signal: args.signal,
+    });
+    if (accessToken.kind === "teams-error") {
+      return accessToken;
+    }
+    headers.authorization = `Bearer ${accessToken.accessToken}`;
+  }
+
+  const responseResult = await settle(
+    fetch(args.url, {
+      method: "GET",
+      headers,
+      signal: args.signal,
+    }),
+    args.signal,
+  );
+  if (!responseResult.ok) {
+    return teamsApiError(502, networkErrorMessage(responseResult.error));
+  }
+
+  return { kind: "ok", response: responseResult.value };
+}
+
+export async function fetchTeamsUsers(args: {
+  readonly tenantId: string;
+  readonly userIds: readonly string[];
+  readonly signal: AbortSignal;
+}): Promise<
+  | {
+      readonly kind: "ok";
+      readonly users: ReadonlyMap<string, TeamsGraphUserInfo>;
+    }
+  | TeamsApiErrorResult
+> {
+  const accessToken = await fetchTeamsGraphAccessToken({
+    tenantId: args.tenantId,
+    signal: args.signal,
+  });
+  if (accessToken.kind === "teams-error") {
+    return accessToken;
+  }
+
+  const users = new Map<string, TeamsGraphUserInfo>();
+  for (const userId of [...new Set(args.userIds)].slice(0, 20)) {
+    const responseResult = await settle(
+      fetch(teamsGraphUserUrl(userId), {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${accessToken.accessToken}`,
+          ...e2eTeamsMockHeaders(),
+        },
+        signal: args.signal,
+      }),
+      args.signal,
+    );
+    if (!responseResult.ok) {
+      return teamsApiError(502, networkErrorMessage(responseResult.error));
+    }
+
+    const response = responseResult.value;
+    const responseText = await response.text();
+    args.signal.throwIfAborted();
+    if (response.status === 404) {
+      continue;
+    }
+    if (!response.ok) {
+      return teamsApiError(
+        response.status,
+        responseText || `Microsoft Graph API returned HTTP ${response.status}`,
+      );
+    }
+
+    const parsed = teamsGraphUserSchema.safeParse(safeJsonParse(responseText));
+    if (!parsed.success || !parsed.data.id) {
+      continue;
+    }
+    users.set(parsed.data.id, {
+      id: parsed.data.id,
+      displayName: parsed.data.displayName ?? null,
+      userPrincipalName:
+        parsed.data.userPrincipalName ?? parsed.data.mail ?? null,
+    });
+  }
+
+  return { kind: "ok", users };
+}
+
+async function postTeamsActivity(args: {
+  readonly serviceUrl: string;
+  readonly conversationId: string;
+  readonly activityId?: string;
+  readonly tenantId: string;
+  readonly activity: TeamsActivityBody;
+  readonly signal: AbortSignal;
+}): Promise<SendTeamsActivityResult> {
+  const accessToken = await fetchTeamsBotAccessToken({
+    tenantId: args.tenantId,
+    signal: args.signal,
+  });
+  if (accessToken.kind === "teams-error") {
+    return accessToken;
+  }
+
+  const url = teamsConversationActivityUrl({
+    serviceUrl: args.serviceUrl,
+    conversationId: args.conversationId,
+    activityId: args.activityId,
+  });
+  if (!url) {
+    return teamsApiError(400, "Invalid Microsoft Teams serviceUrl");
+  }
+
+  const responseResult = await settle(
+    fetch(url, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${accessToken.accessToken}`,
+        "content-type": "application/json",
+        ...e2eTeamsMockHeaders(),
+      },
+      body: JSON.stringify(args.activity),
+      signal: args.signal,
+    }),
+    args.signal,
+  );
+  if (!responseResult.ok) {
+    return teamsApiError(502, networkErrorMessage(responseResult.error));
+  }
+
+  const response = responseResult.value;
+  const responseText = await response.text();
+  args.signal.throwIfAborted();
+  if (!response.ok) {
+    return teamsApiError(
+      response.status,
+      responseText || `Microsoft Teams API returned HTTP ${response.status}`,
+    );
+  }
+
+  if (!responseText) {
+    return { kind: "ok", activityId: undefined };
+  }
+
+  const parsed = teamsActivityResponseSchema.safeParse(
+    safeJsonParse(responseText),
+  );
+  return {
+    kind: "ok",
+    activityId: parsed.success ? parsed.data.id : undefined,
+  };
+}
+
+export async function createTeamsPersonalConversation(args: {
+  readonly serviceUrl: string;
+  readonly tenantId: string;
+  readonly botId: string;
+  readonly botName?: string | null;
+  readonly teamsUserId: string;
+  readonly teamsUserDisplayName?: string | null;
+  readonly signal: AbortSignal;
+}): Promise<CreateTeamsConversationResult> {
+  const accessToken = await fetchTeamsBotAccessToken({
+    tenantId: args.tenantId,
+    signal: args.signal,
+  });
+  if (accessToken.kind === "teams-error") {
+    return accessToken;
+  }
+
+  const url = teamsConversationsUrl(args.serviceUrl);
+  if (!url) {
+    return teamsApiError(400, "Invalid Microsoft Teams serviceUrl");
+  }
+
+  const body: TeamsCreateConversationBody = {
+    bot: {
+      id: args.botId,
+      ...(args.botName ? { name: args.botName } : {}),
+    },
+    members: [
+      {
+        id: args.teamsUserId,
+        ...(args.teamsUserDisplayName
+          ? { name: args.teamsUserDisplayName }
+          : {}),
+      },
+    ],
+    isGroup: false,
+    channelData: {
+      tenant: { id: args.tenantId },
+    },
+  };
+
+  const responseResult = await settle(
+    fetch(url, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${accessToken.accessToken}`,
+        "content-type": "application/json",
+        ...e2eTeamsMockHeaders(),
+      },
+      body: JSON.stringify(body),
+      signal: args.signal,
+    }),
+    args.signal,
+  );
+  if (!responseResult.ok) {
+    return teamsApiError(502, networkErrorMessage(responseResult.error));
+  }
+
+  const response = responseResult.value;
+  const responseText = await response.text();
+  args.signal.throwIfAborted();
+  if (!response.ok) {
+    return teamsApiError(
+      response.status,
+      responseText || `Microsoft Teams API returned HTTP ${response.status}`,
+    );
+  }
+
+  const parsed = teamsConversationResponseSchema.safeParse(
+    safeJsonParse(responseText),
+  );
+  if (!parsed.success) {
+    return teamsApiError(502, "Invalid Microsoft Teams conversation response");
+  }
+
+  return { kind: "ok", conversationId: parsed.data.id };
+}
+
+async function requestTeamsReaction(args: {
+  readonly method: "PUT" | "DELETE";
+  readonly serviceUrl: string;
+  readonly conversationId: string;
+  readonly activityId: string;
+  readonly tenantId: string;
+  readonly reactionType: string;
+  readonly signal: AbortSignal;
+}): Promise<SendTeamsReactionResult> {
+  const accessToken = await fetchTeamsBotAccessToken({
+    tenantId: args.tenantId,
+    signal: args.signal,
+  });
+  if (accessToken.kind === "teams-error") {
+    return accessToken;
+  }
+
+  const url = teamsConversationReactionUrl({
+    serviceUrl: args.serviceUrl,
+    conversationId: args.conversationId,
+    activityId: args.activityId,
+    reactionType: args.reactionType,
+  });
+  if (!url) {
+    return teamsApiError(400, "Invalid Microsoft Teams serviceUrl");
+  }
+
+  const responseResult = await settle(
+    fetch(url, {
+      method: args.method,
+      headers: {
+        authorization: `Bearer ${accessToken.accessToken}`,
+        ...e2eTeamsMockHeaders(),
+      },
+      signal: args.signal,
+    }),
+    args.signal,
+  );
+  if (!responseResult.ok) {
+    return teamsApiError(502, networkErrorMessage(responseResult.error));
+  }
+
+  const response = responseResult.value;
+  const responseText = await response.text();
+  args.signal.throwIfAborted();
+  if (!response.ok) {
+    return teamsApiError(
+      response.status,
+      responseText || `Microsoft Teams API returned HTTP ${response.status}`,
+    );
+  }
+
+  return { kind: "ok" };
+}
+
+export function sendTeamsMessageReply(args: {
+  readonly serviceUrl: string;
+  readonly conversationId: string;
+  readonly activityId?: string;
+  readonly tenantId: string;
+  readonly text: string;
+  readonly card?: TeamsAdaptiveCard;
+  readonly entities?: readonly TeamsMentionEntity[];
+  readonly signal: AbortSignal;
+}): Promise<SendTeamsActivityResult> {
+  return sendTeamsMessage({
+    serviceUrl: args.serviceUrl,
+    conversationId: args.conversationId,
+    activityId: args.activityId,
+    tenantId: args.tenantId,
+    text: args.text,
+    card: args.card,
+    ...(args.entities ? { entities: args.entities } : {}),
+    signal: args.signal,
+  });
+}
+
+export function sendTeamsMessage(args: {
+  readonly serviceUrl: string;
+  readonly conversationId: string;
+  readonly activityId?: string;
+  readonly tenantId: string;
+  readonly text: string;
+  readonly card?: TeamsAdaptiveCard;
+  readonly entities?: readonly TeamsMentionEntity[];
+  readonly attachments?: readonly TeamsActivityAttachment[];
+  readonly signal: AbortSignal;
+}): Promise<SendTeamsActivityResult> {
+  const attachments: readonly TeamsActivityAttachment[] = [
+    ...(args.card
+      ? [
+          {
+            contentType: "application/vnd.microsoft.card.adaptive" as const,
+            content: args.card,
+          },
+        ]
+      : []),
+    ...(args.attachments ?? []),
+  ];
+
+  return postTeamsActivity({
+    serviceUrl: args.serviceUrl,
+    conversationId: args.conversationId,
+    activityId: args.activityId,
+    tenantId: args.tenantId,
+    signal: args.signal,
+    activity: {
+      type: "message",
+      ...(args.card
+        ? { summary: args.text }
+        : { text: args.text, textFormat: "markdown" }),
+      replyToId: args.activityId,
+      ...(args.entities ? { entities: args.entities } : {}),
+      ...(attachments.length > 0 ? { attachments } : {}),
+      channelData: {
+        tenant: { id: args.tenantId },
+      },
+    },
+  });
+}
+
+export function sendTeamsReaction(args: {
+  readonly serviceUrl: string;
+  readonly conversationId: string;
+  readonly activityId: string;
+  readonly tenantId: string;
+  readonly reactionType: string;
+  readonly signal: AbortSignal;
+}): Promise<SendTeamsReactionResult> {
+  return requestTeamsReaction({
+    method: "PUT",
+    ...args,
+  });
+}
+
+export function deleteTeamsReaction(args: {
+  readonly serviceUrl: string;
+  readonly conversationId: string;
+  readonly activityId: string;
+  readonly tenantId: string;
+  readonly reactionType: string;
+  readonly signal: AbortSignal;
+}): Promise<SendTeamsReactionResult> {
+  return requestTeamsReaction({
+    method: "DELETE",
+    ...args,
+  });
+}
+
+export function sendTeamsTypingActivity(args: {
+  readonly serviceUrl: string;
+  readonly conversationId: string;
+  readonly tenantId: string;
+  readonly signal: AbortSignal;
+}): Promise<SendTeamsActivityResult> {
+  return postTeamsActivity({
+    serviceUrl: args.serviceUrl,
+    conversationId: args.conversationId,
+    tenantId: args.tenantId,
+    signal: args.signal,
+    activity: {
+      type: "typing",
+      channelData: {
+        tenant: { id: args.tenantId },
+      },
+    },
+  });
+}
+
+export async function fetchTeamsChannelMessages(args: {
+  readonly tenantId: string;
+  readonly teamId: string;
+  readonly channelId: string;
+  readonly limit: number;
+  readonly signal: AbortSignal;
+}): Promise<FetchTeamsGraphMessagesResult> {
+  const result = await fetchTeamsGraphJson({
+    tenantId: args.tenantId,
+    url: teamsGraphChannelMessageUrl({
+      teamId: args.teamId,
+      channelId: args.channelId,
+      limit: args.limit,
+    }),
+    schema: teamsGraphMessagesResponseSchema,
+    signal: args.signal,
+  });
+  if (result.kind === "teams-error") {
+    return result;
+  }
+  return { kind: "ok", messages: result.data.value };
+}
+
+export async function fetchTeamsChannelMessage(args: {
+  readonly tenantId: string;
+  readonly teamId: string;
+  readonly channelId: string;
+  readonly messageId: string;
+  readonly signal: AbortSignal;
+}): Promise<FetchTeamsGraphMessageResult> {
+  const result = await fetchTeamsGraphJson({
+    tenantId: args.tenantId,
+    url: teamsGraphChannelMessageUrl({
+      teamId: args.teamId,
+      channelId: args.channelId,
+      messageId: args.messageId,
+    }),
+    schema: teamsGraphMessageSchema,
+    signal: args.signal,
+  });
+  if (result.kind === "teams-error") {
+    return result;
+  }
+  return { kind: "ok", message: result.data };
+}
+
+export async function fetchTeamsChannelMessageReplies(args: {
+  readonly tenantId: string;
+  readonly teamId: string;
+  readonly channelId: string;
+  readonly messageId: string;
+  readonly limit: number;
+  readonly signal: AbortSignal;
+}): Promise<FetchTeamsGraphMessagesResult> {
+  const result = await fetchTeamsGraphJson({
+    tenantId: args.tenantId,
+    url: teamsGraphChannelMessageUrl({
+      teamId: args.teamId,
+      channelId: args.channelId,
+      messageId: args.messageId,
+      replies: true,
+      limit: args.limit,
+    }),
+    schema: teamsGraphMessagesResponseSchema,
+    signal: args.signal,
+  });
+  if (result.kind === "teams-error") {
+    return result;
+  }
+  return { kind: "ok", messages: result.data.value };
+}

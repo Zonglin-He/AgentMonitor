@@ -1,0 +1,1688 @@
+import type { ConnectorResponse } from "@vm0/api-contracts/contracts/connector-schemas";
+import { zeroMailContract } from "@vm0/api-contracts/contracts/zero-mail";
+import {
+  zeroConnectorCatalogContract,
+  type PublicConnectorCatalogPermissionDetail,
+  type PublicConnectorCatalogStatusItem,
+} from "@vm0/api-contracts/contracts/zero-connector-catalog";
+import { zeroUserConnectorsContract } from "@vm0/api-contracts/contracts/user-connectors";
+import {
+  zeroUserPermissionGrantsContract,
+  type UserPermissionGrantResponse,
+} from "@vm0/api-contracts/contracts/zero-user-permission-grants";
+import { UNKNOWN_PERMISSION_GRANT } from "@vm0/connectors/firewall-types";
+import { FeatureSwitchKey } from "@vm0/connectors/feature-switch-key";
+import { screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it } from "vitest";
+
+import {
+  detachedSetupPage,
+  queryAllByRoleFast,
+} from "../../../__tests__/page-helper.ts";
+import { isoFromNowMs, mockNow } from "../../../__tests__/time.ts";
+import { testContext } from "../../../signals/__tests__/test-helpers.ts";
+import { mockChatLifecycle } from "./chat-test-helpers.ts";
+
+const context = testContext();
+
+const AGENT_ID = "c0000000-0000-4000-a000-000000000001";
+const THREAD_ID = "thread-action-cards";
+
+function catalogPermissionDetail(
+  overrides: Partial<PublicConnectorCatalogPermissionDetail> &
+    Pick<
+      PublicConnectorCatalogPermissionDetail,
+      "connectorRef" | "label" | "permissions"
+    >,
+): PublicConnectorCatalogPermissionDetail {
+  const { connectorRef, label, permissions, icon, ...rest } = overrides;
+  return {
+    connectorRef,
+    label,
+    icon: icon ?? {
+      url: `https://icons.example.test/${connectorRef}.svg`,
+      invertInDarkMode: false,
+    },
+    permissionCount: permissions.length,
+    permissions,
+    categories: null,
+    defaultPolicy: {
+      permissionDefault: "ask",
+      unknownPolicy: "ask",
+    },
+    ...rest,
+  };
+}
+
+function applyUserConnectorUpdate(
+  current: readonly string[],
+  body: {
+    readonly enabledTypes: readonly string[];
+    readonly operation?: "replace" | "add" | "remove";
+  },
+): string[] {
+  if (body.operation === "add") {
+    return Array.from(new Set([...current, ...body.enabledTypes]));
+  }
+  if (body.operation === "remove") {
+    return current.filter((type) => {
+      return !body.enabledTypes.includes(type);
+    });
+  }
+  return [...body.enabledTypes];
+}
+
+function connectedConnector(
+  overrides: Pick<ConnectorResponse, "type" | "authMethod"> &
+    Partial<ConnectorResponse>,
+): ConnectorResponse {
+  return {
+    id: crypto.randomUUID(),
+    externalId: null,
+    externalUsername: null,
+    externalEmail: null,
+    oauthScopes: null,
+    connectionStatus: "connected",
+    reconnectReason: null,
+    tokenExpiresAt: null,
+    createdAt: "2026-01-01T00:00:00Z",
+    updatedAt: "2026-01-01T00:00:00Z",
+    ...overrides,
+  };
+}
+
+function publicConnectorStatusItem(
+  overrides: Partial<PublicConnectorCatalogStatusItem> &
+    Pick<PublicConnectorCatalogStatusItem, "connectorRef" | "label">,
+): PublicConnectorCatalogStatusItem {
+  const { connectorRef, label, icon, ...rest } = overrides;
+  return {
+    connectorRef,
+    label,
+    description: `${label} public help text`,
+    icon: icon ?? {
+      url: `https://icons.example.test/${connectorRef}.svg`,
+      invertInDarkMode: false,
+    },
+    category: "data-automation-infrastructure",
+    generation: [],
+    tags: [],
+    authMethods: [],
+    permissionSummary: {
+      hasPermissions: false,
+      permissionCount: 0,
+      hasCategories: false,
+      hasDefaultPolicyOverrides: false,
+    },
+    connection: null,
+    connected: false,
+    connectionStatus: "not-connected",
+    scopeMismatch: false,
+    authMethodSupportsRefresh: false,
+    tokenExpiresAt: null,
+    singleAuthCodeAuthMethodId: null,
+    connectNotice: null,
+    ...rest,
+  };
+}
+
+function mockConnectorCatalogStatus(
+  connectors: readonly PublicConnectorCatalogStatusItem[],
+): void {
+  context.mocks.api(zeroConnectorCatalogContract.status, ({ respond }) => {
+    return respond(200, { connectors: [...connectors] });
+  });
+}
+
+function mockAgentConnectorAuthorizations(
+  initialTypes: readonly string[],
+): void {
+  let enabledTypes: string[] = [...initialTypes];
+  context.mocks.api(zeroUserConnectorsContract.get, ({ respond }) => {
+    return respond(200, { enabledTypes });
+  });
+  context.mocks.api(zeroUserConnectorsContract.update, ({ body, respond }) => {
+    enabledTypes = applyUserConnectorUpdate(enabledTypes, body);
+    return respond(200, { enabledTypes });
+  });
+}
+
+function encodeBase64UrlJson(value: unknown): string {
+  return btoa(JSON.stringify(value))
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/u, "");
+}
+
+function queryButtonByText(
+  text: string,
+  container: ParentNode,
+): HTMLElement | null {
+  return (
+    queryAllByRoleFast("button", container).find((candidate) => {
+      return candidate.textContent?.replace(/\s+/g, " ").trim() === text;
+    }) ?? null
+  );
+}
+
+function buttonByText(text: string, container: ParentNode): HTMLElement {
+  const button = queryButtonByText(text, container);
+  if (!button) {
+    throw new Error(`${text} button not found`);
+  }
+  return button;
+}
+
+async function waitForButtonByText(
+  text: string,
+  container: ParentNode,
+): Promise<HTMLElement> {
+  let button: HTMLElement | undefined;
+  await waitFor(() => {
+    button = buttonByText(text, container);
+    expect(button).toBeEnabled();
+  });
+  if (!button) {
+    throw new Error(`${text} button not found`);
+  }
+  return button;
+}
+
+async function confirmPermissionAction(
+  user: ReturnType<typeof userEvent.setup>,
+  card: HTMLElement,
+): Promise<void> {
+  await user.click(await waitForButtonByText("Confirm", card));
+}
+
+describe("chat message action cards", () => {
+  it("renders a persistent mail draft and sends the reviewed fields", async () => {
+    const user = userEvent.setup({ delay: null });
+    const threadId = "c0000000-0000-4000-a000-000000000010";
+    const messageId = "c0000000-0000-4000-a000-000000000011";
+    const createdAt = "2026-07-14T10:00:00.000Z";
+    let sentBody: unknown = null;
+
+    context.mocks.api(zeroMailContract.updateDraft, ({ body, respond }) => {
+      return respond(200, {
+        messageId,
+        mailDraft: {
+          version: 1,
+          provider: "gmail",
+          from: "sender@example.com",
+          ...body,
+          status: "draft",
+          createdAt,
+          updatedAt: "2026-07-14T10:01:00.000Z",
+        },
+      });
+    });
+    context.mocks.api(zeroMailContract.sendDraft, ({ body, respond }) => {
+      sentBody = body;
+      return respond(200, {
+        messageId,
+        mailDraft: {
+          version: 1,
+          provider: "gmail",
+          from: "sender@example.com",
+          ...body,
+          status: "sent",
+          createdAt,
+          updatedAt: "2026-07-14T10:02:00.000Z",
+          sentAt: "2026-07-14T10:02:00.000Z",
+        },
+      });
+    });
+    mockChatLifecycle(context, {
+      threadId,
+      threadTitle: "Mail card",
+      chatMessages: [
+        {
+          id: messageId,
+          role: "assistant",
+          content: null,
+          createdAt,
+          mailDraft: {
+            version: 1,
+            provider: "gmail",
+            from: "sender@example.com",
+            to: ["recipient@example.com"],
+            subject: "Hello",
+            body: "Mail body",
+            status: "draft",
+            createdAt,
+            updatedAt: createdAt,
+          },
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${threadId}`,
+      featureSwitches: { [FeatureSwitchKey.ZeroMail]: true },
+    });
+
+    const card = await screen.findByRole("region", { name: "Review email" });
+    expect(within(card).getByRole("textbox", { name: "From" })).toHaveValue(
+      "sender@example.com",
+    );
+    expect(within(card).getByRole("textbox", { name: "To" })).toHaveValue(
+      "recipient@example.com",
+    );
+    expect(within(card).getByRole("textbox", { name: "Subject" })).toHaveValue(
+      "Hello",
+    );
+    expect(within(card).getByRole("textbox", { name: "Message" })).toHaveValue(
+      "Mail body",
+    );
+
+    await user.click(buttonByText("Send", card));
+
+    await waitFor(() => {
+      expect(sentBody).toStrictEqual({
+        to: ["recipient@example.com"],
+        subject: "Hello",
+        body: "Mail body",
+      });
+      expect(within(card).getByText("Sent")).toBeInTheDocument();
+    });
+    expect(queryButtonByText("Send", card)).toBeNull();
+    expect(within(card).getByRole("textbox", { name: "From" })).toHaveAttribute(
+      "readonly",
+    );
+  });
+
+  it("lets users authorize connectors and confirm permissions from assistant messages", async () => {
+    mockNow();
+    const user = userEvent.setup({ delay: null });
+    const connectorAuthorizeUrl = `https://app.vm0.ai/connectors/github/authorize?agentId=${AGENT_ID}`;
+    const permissionAuthorizeUrl = `https://app.vm0.ai/agents/${AGENT_ID}/permissions?ref=slack&permission=catalog.analytics%3Aread&action=allow&expiresIn=24h`;
+    let capturedPermissionGrantBody: unknown = null;
+
+    context.mocks.data.connectors([
+      connectedConnector({
+        type: "github",
+        authMethod: "oauth",
+        externalUsername: "octocat",
+      }),
+    ]);
+    mockConnectorCatalogStatus([
+      publicConnectorStatusItem({
+        connectorRef: "github",
+        label: "Catalog GitHub",
+        description: "Catalog GitHub server help text",
+        icon: {
+          url: "https://icons.example.test/action-github.svg",
+          invertInDarkMode: true,
+        },
+        connected: true,
+        connectionStatus: "connected",
+        connection: {
+          authMethod: "oauth",
+          externalUsername: "octocat",
+          externalEmail: null,
+          reconnectReason: null,
+        },
+      }),
+    ]);
+    mockAgentConnectorAuthorizations([]);
+    context.mocks.api(
+      zeroConnectorCatalogContract.permissions,
+      ({ params, respond }) => {
+        expect(params.connectorRef).toBe("slack");
+        return respond(200, {
+          permissions: catalogPermissionDetail({
+            connectorRef: "slack",
+            label: "Catalog Slack",
+            permissions: [
+              {
+                name: "catalog.analytics:read",
+                description: "Catalog analytics access",
+              },
+            ],
+          }),
+        });
+      },
+    );
+    context.mocks.api(
+      zeroUserPermissionGrantsContract.apply,
+      ({ body, respond }) => {
+        capturedPermissionGrantBody = body;
+        const grant = body.grants[0];
+        if (!grant) {
+          throw new Error("Expected a permission grant");
+        }
+        return respond(200, [
+          {
+            agentId: body.agentId,
+            connectorRef: body.connectorRef,
+            permission: grant.permission,
+            action: grant.action,
+            expiresAt: isoFromNowMs(24 * 60 * 60 * 1000),
+            createdAt: "2026-06-09T11:00:00Z",
+            updatedAt: "2026-06-09T11:01:00Z",
+          },
+        ]);
+      },
+    );
+    mockChatLifecycle(context, {
+      threadId: THREAD_ID,
+      threadTitle: "Action cards",
+      chatMessages: [
+        {
+          id: "msg-user-action-request",
+          role: "user",
+          content: "Set up the integrations",
+          runId: "run-action-cards",
+          createdAt: "2026-06-09T10:00:00Z",
+        },
+        {
+          id: "msg-assistant-action-cards",
+          role: "assistant",
+          content: `${connectorAuthorizeUrl}\n\n${permissionAuthorizeUrl}`,
+          runId: "run-action-cards",
+          createdAt: "2026-06-09T10:01:00Z",
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${THREAD_ID}`,
+    });
+
+    const connectorCard = await screen.findByTestId("connector-action-card");
+    expect(
+      within(connectorCard).getByText("Catalog GitHub"),
+    ).toBeInTheDocument();
+    expect(
+      within(connectorCard).getByText("Catalog GitHub server help text"),
+    ).toBeInTheDocument();
+    expect(connectorCard.querySelector("img")).toHaveAttribute(
+      "src",
+      "https://icons.example.test/action-github.svg",
+    );
+    await user.click(within(connectorCard).getByText("Connect"));
+
+    await waitFor(() => {
+      expect(within(connectorCard).getByText("Connected")).toBeInTheDocument();
+    });
+
+    const permissionCard = await screen.findByTestId("permission-action-card");
+    await waitFor(() => {
+      expect(
+        within(permissionCard).getByText("Catalog Slack permissions"),
+      ).toBeInTheDocument();
+      expect(
+        within(permissionCard).getByText("Allow catalog.analytics:read"),
+      ).toBeInTheDocument();
+    });
+    expect(within(permissionCard).getByText("24 hours")).toBeInTheDocument();
+
+    await confirmPermissionAction(user, permissionCard);
+
+    await waitFor(() => {
+      expect(
+        within(permissionCard).getByText("Permissions updated"),
+      ).toBeInTheDocument();
+      expect(capturedPermissionGrantBody).toMatchObject({
+        agentId: AGENT_ID,
+        connectorRef: "slack",
+        mode: "patch",
+        grants: [
+          {
+            permission: "catalog.analytics:read",
+            action: "allow",
+            expiresIn: "24h",
+          },
+        ],
+      });
+    });
+  });
+
+  it("renders and confirms multiple permission cards from one assistant message", async () => {
+    mockNow();
+    const user = userEvent.setup({ delay: null });
+    const createPermissionUrl = `https://app.vm0.ai/agents/${AGENT_ID}/permissions?ref=google-sheets&permission=spreadsheets.create&action=allow&expiresIn=1h`;
+    const writePermissionUrl = `https://app.vm0.ai/agents/${AGENT_ID}/permissions?ref=google-sheets&permission=values.write&action=allow&expiresIn=1h`;
+    const capturedPermissionGrantBodies: unknown[] = [];
+
+    context.mocks.api(
+      zeroConnectorCatalogContract.permissions,
+      ({ params, respond }) => {
+        expect(params.connectorRef).toBe("google-sheets");
+        return respond(200, {
+          permissions: catalogPermissionDetail({
+            connectorRef: "google-sheets",
+            label: "Google Sheets",
+            permissions: [
+              {
+                name: "spreadsheets.create",
+                description: "Create spreadsheets",
+              },
+              {
+                name: "values.write",
+                description: "Write spreadsheet values",
+              },
+            ],
+          }),
+        });
+      },
+    );
+    context.mocks.api(
+      zeroUserPermissionGrantsContract.apply,
+      ({ body, respond }) => {
+        capturedPermissionGrantBodies.push(body);
+        const grant = body.grants[0];
+        if (!grant) {
+          throw new Error("Expected a permission grant");
+        }
+        return respond(200, [
+          {
+            agentId: body.agentId,
+            connectorRef: body.connectorRef,
+            permission: grant.permission,
+            action: grant.action,
+            expiresAt: isoFromNowMs(60 * 60 * 1000),
+            createdAt: "2026-06-09T11:00:00Z",
+            updatedAt: "2026-06-09T11:01:00Z",
+          },
+        ]);
+      },
+    );
+    mockChatLifecycle(context, {
+      threadId: `${THREAD_ID}-multiple-permissions`,
+      threadTitle: "Multiple permission cards",
+      chatMessages: [
+        {
+          id: "msg-user-multiple-permissions",
+          role: "user",
+          content: "Create and populate a spreadsheet",
+          runId: "run-multiple-permissions",
+          createdAt: "2026-06-09T10:00:00Z",
+        },
+        {
+          id: "msg-assistant-multiple-permissions",
+          role: "assistant",
+          content: `${createPermissionUrl}\n${writePermissionUrl}`,
+          runId: "run-multiple-permissions",
+          createdAt: "2026-06-09T10:01:00Z",
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${THREAD_ID}-multiple-permissions`,
+    });
+
+    const permissionCards = await screen.findAllByTestId(
+      "permission-action-card",
+    );
+    expect(permissionCards).toHaveLength(2);
+    const [createCard, writeCard] = permissionCards;
+    if (!createCard || !writeCard) {
+      throw new Error("Expected two permission cards");
+    }
+    await waitFor(() => {
+      expect(
+        within(createCard).getByText("Allow spreadsheets.create"),
+      ).toBeInTheDocument();
+      expect(
+        within(writeCard).getByText("Allow values.write"),
+      ).toBeInTheDocument();
+    });
+
+    await confirmPermissionAction(user, createCard);
+    await waitFor(() => {
+      expect(
+        within(createCard).getByText("Permissions updated"),
+      ).toBeInTheDocument();
+    });
+    await confirmPermissionAction(user, writeCard);
+    await waitFor(() => {
+      expect(
+        within(writeCard).getByText("Permissions updated"),
+      ).toBeInTheDocument();
+    });
+
+    expect(capturedPermissionGrantBodies).toStrictEqual([
+      {
+        agentId: AGENT_ID,
+        connectorRef: "google-sheets",
+        mode: "patch",
+        grants: [
+          {
+            permission: "spreadsheets.create",
+            action: "allow",
+            expiresIn: "1h",
+          },
+        ],
+      },
+      {
+        agentId: AGENT_ID,
+        connectorRef: "google-sheets",
+        mode: "patch",
+        grants: [
+          {
+            permission: "values.write",
+            action: "allow",
+            expiresIn: "1h",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("omits connector action cards when catalog metadata is hidden", async () => {
+    const hiddenConnectorAuthorizeUrl = `https://app.vm0.ai/connectors/github/authorize?agentId=${AGENT_ID}`;
+    const visibleConnectorAuthorizeUrl = `https://app.vm0.ai/connectors/slack/authorize?agentId=${AGENT_ID}`;
+    mockConnectorCatalogStatus([
+      publicConnectorStatusItem({
+        connectorRef: "slack",
+        label: "Catalog Slack",
+        description: "Catalog Slack server help text",
+      }),
+    ]);
+    mockChatLifecycle(context, {
+      threadId: `${THREAD_ID}-hidden-connector-metadata`,
+      threadTitle: "Hidden connector metadata",
+      chatMessages: [
+        {
+          id: "msg-user-hidden-connector",
+          role: "user",
+          content: "Connect hidden catalog connector",
+          runId: "run-hidden-connector",
+          createdAt: "2026-06-09T10:00:00Z",
+        },
+        {
+          id: "msg-assistant-hidden-connector-card",
+          role: "assistant",
+          content: `${hiddenConnectorAuthorizeUrl}\n\n${visibleConnectorAuthorizeUrl}`,
+          runId: "run-hidden-connector",
+          createdAt: "2026-06-09T10:01:00Z",
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${THREAD_ID}-hidden-connector-metadata`,
+    });
+
+    const userMessage = await screen.findByText(
+      "Connect hidden catalog connector",
+    );
+    expect(userMessage).toBeInTheDocument();
+    const connectorCards = await screen.findAllByTestId(
+      "connector-action-card",
+    );
+    expect(connectorCards).toHaveLength(1);
+    expect(
+      within(connectorCards[0]!).getByText("Catalog Slack"),
+    ).toBeInTheDocument();
+    expect(
+      within(connectorCards[0]!).getByText("Catalog Slack server help text"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("GitHub")).not.toBeInTheDocument();
+  });
+
+  it("keeps catalog-visible connectors actionable without a bundled type", async () => {
+    const user = userEvent.setup({ delay: null });
+    const connectorAuthorizeUrl = `https://app.vm0.ai/connectors/future-connector/authorize?agentId=${AGENT_ID}`;
+    mockConnectorCatalogStatus([
+      publicConnectorStatusItem({
+        connectorRef: "future-connector",
+        label: "Catalog Future Connector",
+        description: "Catalog future connector help text",
+        authMethods: [
+          {
+            id: "partner-token",
+            label: "Partner token",
+            description: null,
+            grantKind: "manual",
+            manualFields: [
+              {
+                id: "apiKey",
+                label: "API key",
+                required: true,
+                placeholder: null,
+                inputType: "password",
+              },
+            ],
+            startOptions: [],
+          },
+        ],
+      }),
+    ]);
+    mockChatLifecycle(context, {
+      threadId: `${THREAD_ID}-future-connector`,
+      threadTitle: "Future connector",
+      chatMessages: [
+        {
+          id: "msg-user-future-connector",
+          role: "user",
+          content: "Connect future connector",
+          runId: "run-future-connector",
+          createdAt: "2026-06-09T10:00:00Z",
+        },
+        {
+          id: "msg-assistant-future-connector-card",
+          role: "assistant",
+          content: connectorAuthorizeUrl,
+          runId: "run-future-connector",
+          createdAt: "2026-06-09T10:01:00Z",
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${THREAD_ID}-future-connector`,
+    });
+
+    const connectorCard = await screen.findByTestId("connector-action-card");
+    expect(
+      within(connectorCard).getByText("Catalog Future Connector"),
+    ).toBeInTheDocument();
+    expect(
+      within(connectorCard).getByText("Catalog future connector help text"),
+    ).toBeInTheDocument();
+    const connectButton = buttonByText("Connect", connectorCard);
+    expect(connectButton).toBeEnabled();
+    await user.click(connectButton);
+    expect((await screen.findAllByText("API key")).length).toBeGreaterThan(0);
+  });
+
+  it("fails closed when permission action metadata is hidden", async () => {
+    const permissionAuthorizeUrl = `https://app.vm0.ai/agents/${AGENT_ID}/permissions?ref=hidden-connector&permission=hidden.permission&action=allow&expiresIn=1h`;
+    context.mocks.api(
+      zeroConnectorCatalogContract.permissions,
+      ({ respond }) => {
+        return respond(404, {
+          error: { message: "Connector not found", code: "NOT_FOUND" },
+        });
+      },
+    );
+    mockChatLifecycle(context, {
+      threadId: `${THREAD_ID}-hidden-permission-metadata`,
+      threadTitle: "Hidden permission metadata",
+      chatMessages: [
+        {
+          id: "msg-user-hidden-permission",
+          role: "user",
+          content: "Allow a hidden connector permission",
+          runId: "run-hidden-permission",
+          createdAt: "2026-06-09T10:00:00Z",
+        },
+        {
+          id: "msg-assistant-hidden-permission-card",
+          role: "assistant",
+          content: permissionAuthorizeUrl,
+          runId: "run-hidden-permission",
+          createdAt: "2026-06-09T10:01:00Z",
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${THREAD_ID}-hidden-permission-metadata`,
+    });
+
+    const permissionCard = await screen.findByTestId("permission-action-card");
+    await waitFor(() => {
+      expect(
+        within(permissionCard).getByText("hidden-connector permissions"),
+      ).toBeInTheDocument();
+      expect(
+        within(permissionCard).getByText("Unknown permission"),
+      ).toBeInTheDocument();
+    });
+    expect(queryButtonByText("Confirm", permissionCard)).toBeNull();
+  });
+
+  it("shows already allowed permission action cards as read-only after refresh", async () => {
+    mockNow();
+    const permissionAuthorizeUrl = `https://app.vm0.ai/agents/${AGENT_ID}/permissions?ref=youtube&permission=videos.write&action=allow&expiresIn=24h`;
+    let applyRequests = 0;
+    context.mocks.api(zeroUserPermissionGrantsContract.list, ({ respond }) => {
+      return respond(200, [
+        {
+          agentId: AGENT_ID,
+          connectorRef: "youtube",
+          permission: "videos.write",
+          action: "allow",
+          expiresAt: isoFromNowMs(7 * 24 * 60 * 60 * 1000),
+          createdAt: "2026-06-09T11:00:00Z",
+          updatedAt: "2026-06-09T11:01:00Z",
+        },
+      ]);
+    });
+    context.mocks.api(zeroUserPermissionGrantsContract.apply, ({ respond }) => {
+      applyRequests += 1;
+      return respond(200, []);
+    });
+    mockChatLifecycle(context, {
+      threadId: `${THREAD_ID}-already-allowed-permission`,
+      threadTitle: "Permission already allowed",
+      chatMessages: [
+        {
+          id: "msg-user-already-allowed-permission",
+          role: "user",
+          content: "Upload the video",
+          runId: "run-already-allowed-permission",
+          createdAt: "2026-06-09T11:00:00Z",
+        },
+        {
+          id: "msg-assistant-already-allowed-permission-card",
+          role: "assistant",
+          content: permissionAuthorizeUrl,
+          runId: "run-already-allowed-permission",
+          createdAt: "2026-06-09T11:01:00Z",
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${THREAD_ID}-already-allowed-permission`,
+    });
+
+    const permissionCard = await screen.findByTestId("permission-action-card");
+    await waitFor(() => {
+      expect(
+        within(permissionCard).getByText("Already allowed"),
+      ).toBeInTheDocument();
+    });
+    expect(
+      within(permissionCard).getByText("Expires in 7 days"),
+    ).toBeInTheDocument();
+    expect(
+      within(permissionCard).queryByText("Confirm"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(permissionCard).queryByLabelText("Permission duration"),
+    ).not.toBeInTheDocument();
+    expect(applyRequests).toBe(0);
+  });
+
+  it("lets users re-confirm expired allow permission action cards", async () => {
+    mockNow();
+    const permissionAuthorizeUrl = `https://app.vm0.ai/agents/${AGENT_ID}/permissions?ref=youtube&permission=videos.write&action=allow&expiresIn=24h`;
+    let applyRequests = 0;
+    context.mocks.api(zeroUserPermissionGrantsContract.list, ({ respond }) => {
+      return respond(200, [
+        {
+          agentId: AGENT_ID,
+          connectorRef: "youtube",
+          permission: "videos.write",
+          action: "allow",
+          expiresAt: isoFromNowMs(-60 * 1000),
+          createdAt: "2026-06-09T11:00:00Z",
+          updatedAt: "2026-06-09T11:01:00Z",
+        },
+      ]);
+    });
+    context.mocks.api(zeroUserPermissionGrantsContract.apply, ({ respond }) => {
+      applyRequests += 1;
+      return respond(200, [
+        {
+          agentId: AGENT_ID,
+          connectorRef: "youtube",
+          permission: "videos.write",
+          action: "allow",
+          expiresAt: isoFromNowMs(24 * 60 * 60 * 1000),
+          createdAt: "2026-06-09T11:00:00Z",
+          updatedAt: "2026-06-09T12:00:00Z",
+        },
+      ]);
+    });
+    mockChatLifecycle(context, {
+      threadId: `${THREAD_ID}-expired-allowed-permission`,
+      threadTitle: "Expired permission allow",
+      chatMessages: [
+        {
+          id: "msg-user-expired-allowed-permission",
+          role: "user",
+          content: "Upload the video",
+          runId: "run-expired-allowed-permission",
+          createdAt: "2026-06-09T11:00:00Z",
+        },
+        {
+          id: "msg-assistant-expired-allowed-permission-card",
+          role: "assistant",
+          content: permissionAuthorizeUrl,
+          runId: "run-expired-allowed-permission",
+          createdAt: "2026-06-09T11:01:00Z",
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${THREAD_ID}-expired-allowed-permission`,
+    });
+
+    const permissionCard = await screen.findByTestId("permission-action-card");
+    await waitFor(() => {
+      expect(within(permissionCard).getByText("Expired")).toBeInTheDocument();
+      expect(within(permissionCard).getByText("Confirm")).toBeInTheDocument();
+    });
+    expect(
+      within(permissionCard).queryByText("Already allowed"),
+    ).not.toBeInTheDocument();
+
+    await confirmPermissionAction(
+      userEvent.setup({ delay: null }),
+      permissionCard,
+    );
+    await waitFor(() => {
+      expect(
+        within(permissionCard).getByText("Permissions updated"),
+      ).toBeInTheDocument();
+    });
+    expect(applyRequests).toBe(1);
+  });
+
+  it("shows already denied permission action cards as read-only after refresh", async () => {
+    const permissionDenyUrl = `https://app.vm0.ai/agents/${AGENT_ID}/permissions?ref=slack&permission=admin.analytics%3Aread&action=deny`;
+    let applyRequests = 0;
+    context.mocks.api(zeroUserPermissionGrantsContract.list, ({ respond }) => {
+      return respond(200, [
+        {
+          agentId: AGENT_ID,
+          connectorRef: "slack",
+          permission: "admin.analytics:read",
+          action: "deny",
+          expiresAt: null,
+          createdAt: "2026-06-09T11:00:00Z",
+          updatedAt: "2026-06-09T11:01:00Z",
+        },
+      ]);
+    });
+    context.mocks.api(zeroUserPermissionGrantsContract.apply, ({ respond }) => {
+      applyRequests += 1;
+      return respond(200, []);
+    });
+    mockChatLifecycle(context, {
+      threadId: `${THREAD_ID}-already-denied-permission`,
+      threadTitle: "Permission already denied",
+      chatMessages: [
+        {
+          id: "msg-user-already-denied-permission",
+          role: "user",
+          content: "Block the Slack analytics request",
+          runId: "run-already-denied-permission",
+          createdAt: "2026-06-09T11:00:00Z",
+        },
+        {
+          id: "msg-assistant-already-denied-permission-card",
+          role: "assistant",
+          content: permissionDenyUrl,
+          runId: "run-already-denied-permission",
+          createdAt: "2026-06-09T11:01:00Z",
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${THREAD_ID}-already-denied-permission`,
+    });
+
+    const permissionCard = await screen.findByTestId("permission-action-card");
+    await waitFor(() => {
+      expect(
+        within(permissionCard).getByText("Already denied"),
+      ).toBeInTheDocument();
+    });
+    expect(
+      within(permissionCard).queryByText("Confirm"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(permissionCard).queryByLabelText("Permission duration"),
+    ).not.toBeInTheDocument();
+    expect(applyRequests).toBe(0);
+  });
+
+  it("renders custom connector proposal links as configure cards", async () => {
+    const proposalUrl = `https://app.vm0.ai/connectors/custom/proposal?p=${encodeBase64UrlJson(
+      {
+        operation: "create",
+        displayName: "Acme Internal API",
+        prefixTemplates: ["https://{{variables.subdomain}}.acme.test/v1/"],
+        fields: [
+          {
+            key: "api_key",
+            label: "API key",
+            kind: "secret",
+            required: true,
+          },
+          {
+            key: "subdomain",
+            label: "Subdomain",
+            kind: "variable",
+            required: true,
+          },
+        ],
+        headerInjections: [
+          {
+            name: "Authorization",
+            valueTemplate: "Bearer {{secrets.api_key}}",
+          },
+        ],
+        queryInjections: [],
+      },
+    )}&agentId=${AGENT_ID}`;
+
+    mockChatLifecycle(context, {
+      threadId: `${THREAD_ID}-custom-connector`,
+      threadTitle: "Custom connector card",
+      chatMessages: [
+        {
+          id: "msg-user-custom-connector",
+          role: "user",
+          content: "Set up the custom connector",
+          runId: "run-custom-connector",
+          createdAt: "2026-06-09T10:00:00Z",
+        },
+        {
+          id: "msg-assistant-custom-connector-card",
+          role: "assistant",
+          content: proposalUrl,
+          runId: "run-custom-connector",
+          createdAt: "2026-06-09T10:01:00Z",
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${THREAD_ID}-custom-connector`,
+    });
+
+    const card = await screen.findByTestId("custom-connector-action-card");
+    expect(within(card).getByText("Acme Internal API")).toBeInTheDocument();
+    expect(
+      within(card).getByText(
+        "Review, connect, and authorize this custom connector for the agent.",
+      ),
+    ).toBeInTheDocument();
+    const configureLink = queryAllByRoleFast("link", card).find((link) => {
+      return /configure/i.test(link.textContent ?? "");
+    });
+    expect(configureLink).toHaveAttribute("href", proposalUrl);
+  });
+
+  it("renders delegated computer use authorization links as action cards", async () => {
+    const authorizationUrl =
+      "https://app.vm0.ai/computer-use/authorize/vm0_computer_use_authorization_request_test";
+
+    mockChatLifecycle(context, {
+      threadId: `${THREAD_ID}-computer-use-authorization`,
+      threadTitle: "Computer Use authorization card",
+      chatMessages: [
+        {
+          id: "msg-user-computer-use-authorization",
+          role: "user",
+          content: "Use my desktop",
+          runId: "run-computer-use-authorization",
+          createdAt: "2026-06-09T10:00:00Z",
+        },
+        {
+          id: "msg-assistant-computer-use-authorization-card",
+          role: "assistant",
+          content: authorizationUrl,
+          runId: "run-computer-use-authorization",
+          createdAt: "2026-06-09T10:01:00Z",
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${THREAD_ID}-computer-use-authorization`,
+    });
+
+    const card = await screen.findByTestId("computer-use-authorization-card");
+    expect(
+      within(card).getByText("Computer Use authorization"),
+    ).toBeInTheDocument();
+    expect(
+      within(card).getByText(
+        "Select a Desktop host for future runs in this thread.",
+      ),
+    ).toBeInTheDocument();
+    const authorizeLink = queryAllByRoleFast("link", card).find((link) => {
+      return /authorize/i.test(link.textContent ?? "");
+    });
+    expect(authorizeLink).toHaveAttribute(
+      "href",
+      "/computer-use/authorize/vm0_computer_use_authorization_request_test",
+    );
+  });
+
+  it("automatically retries permission action loading before showing an error", async () => {
+    mockNow();
+    const user = userEvent.setup({ delay: null });
+    const permissionAuthorizeUrl = `https://app.vm0.ai/agents/${AGENT_ID}/permissions?ref=gmail&permission=messages.write&action=allow&expiresIn=1h`;
+    let listRequests = 0;
+    let capturedBody: unknown = null;
+    context.mocks.api(zeroUserPermissionGrantsContract.list, ({ respond }) => {
+      listRequests += 1;
+      if (listRequests === 1) {
+        throw new Error("temporary permission grant load failure");
+      }
+      return respond(200, []);
+    });
+    context.mocks.api(
+      zeroUserPermissionGrantsContract.apply,
+      ({ body, respond }) => {
+        const grant = body.grants[0];
+        if (!grant) {
+          throw new Error("Expected a permission grant");
+        }
+        capturedBody = body;
+        return respond(200, [
+          {
+            agentId: body.agentId,
+            connectorRef: body.connectorRef,
+            permission: grant.permission,
+            action: grant.action,
+            expiresAt: isoFromNowMs(60 * 60 * 1000),
+            createdAt: "2026-06-09T11:00:00Z",
+            updatedAt: "2026-06-09T11:01:00Z",
+          },
+        ]);
+      },
+    );
+    mockChatLifecycle(context, {
+      threadId: `${THREAD_ID}-permission-load-retry`,
+      threadTitle: "Permission load retry",
+      chatMessages: [
+        {
+          id: "msg-user-permission-load-retry",
+          role: "user",
+          content: "Allow Gmail message writes",
+          runId: "run-permission-load-retry",
+          createdAt: "2026-06-09T11:00:00Z",
+        },
+        {
+          id: "msg-assistant-permission-load-retry-card",
+          role: "assistant",
+          content: permissionAuthorizeUrl,
+          runId: "run-permission-load-retry",
+          createdAt: "2026-06-09T11:01:00Z",
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${THREAD_ID}-permission-load-retry`,
+    });
+
+    const permissionCard = await screen.findByTestId("permission-action-card");
+    await waitFor(() => {
+      expect(
+        within(permissionCard).getByText("Gmail permissions"),
+      ).toBeInTheDocument();
+      expect(
+        within(permissionCard).getByText("Allow messages.write"),
+      ).toBeInTheDocument();
+    });
+
+    await waitForButtonByText("Confirm", permissionCard);
+    expect(listRequests).toBe(2);
+    expect(
+      within(permissionCard).queryByText("Failed to load permissions"),
+    ).not.toBeInTheDocument();
+
+    await confirmPermissionAction(user, permissionCard);
+
+    await waitFor(() => {
+      expect(
+        within(permissionCard).getByText("Permissions updated"),
+      ).toBeInTheDocument();
+      expect(capturedBody).toMatchObject({
+        agentId: AGENT_ID,
+        connectorRef: "gmail",
+        mode: "patch",
+        grants: [
+          {
+            permission: "messages.write",
+            action: "allow",
+            expiresIn: "1h",
+          },
+        ],
+      });
+    });
+  });
+
+  it("shows permission status loading outside the action button", async () => {
+    const permissionAuthorizeUrl = `https://app.vm0.ai/agents/${AGENT_ID}/permissions?ref=gmail&permission=messages.write&action=allow&expiresIn=1h`;
+    let resolveList: () => void = () => {
+      throw new Error("Permission grant list request did not start");
+    };
+    context.mocks.api(
+      zeroUserPermissionGrantsContract.list,
+      async ({ deferred, respond }) => {
+        const listDeferred = deferred<void>();
+        resolveList = () => {
+          listDeferred.resolve();
+        };
+        await listDeferred.promise;
+        return respond(200, []);
+      },
+    );
+
+    mockChatLifecycle(context, {
+      threadId: `${THREAD_ID}-permission-status-loading`,
+      threadTitle: "Permission status loading",
+      chatMessages: [
+        {
+          id: "msg-user-permission-status-loading",
+          role: "user",
+          content: "Allow Gmail message writes",
+          runId: "run-permission-status-loading",
+          createdAt: "2026-06-09T11:00:00Z",
+        },
+        {
+          id: "msg-assistant-permission-status-loading-card",
+          role: "assistant",
+          content: permissionAuthorizeUrl,
+          runId: "run-permission-status-loading",
+          createdAt: "2026-06-09T11:01:00Z",
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${THREAD_ID}-permission-status-loading`,
+    });
+
+    const permissionCard = await screen.findByTestId("permission-action-card");
+    expect(
+      within(permissionCard).getByText("Checking permission status..."),
+    ).toBeInTheDocument();
+    expect(
+      queryButtonByText("Checking permission status...", permissionCard),
+    ).toBeNull();
+    expect(queryButtonByText("Confirm", permissionCard)).toBeNull();
+
+    resolveList();
+    await waitForButtonByText("Confirm", permissionCard);
+  });
+
+  it("does not retry non-transient permission action loading failures", async () => {
+    const permissionAuthorizeUrl = `https://app.vm0.ai/agents/${AGENT_ID}/permissions?ref=gmail&permission=messages.write&action=allow&expiresIn=1h`;
+    let listRequests = 0;
+    context.mocks.api(zeroUserPermissionGrantsContract.list, ({ respond }) => {
+      listRequests += 1;
+      return respond(403, {
+        error: {
+          code: "FORBIDDEN",
+          message: "Forbidden",
+        },
+      });
+    });
+
+    mockChatLifecycle(context, {
+      threadId: `${THREAD_ID}-permission-load-forbidden`,
+      threadTitle: "Permission load forbidden",
+      chatMessages: [
+        {
+          id: "msg-user-permission-load-forbidden",
+          role: "user",
+          content: "Allow Gmail message writes",
+          runId: "run-permission-load-forbidden",
+          createdAt: "2026-06-09T11:00:00Z",
+        },
+        {
+          id: "msg-assistant-permission-load-forbidden-card",
+          role: "assistant",
+          content: permissionAuthorizeUrl,
+          runId: "run-permission-load-forbidden",
+          createdAt: "2026-06-09T11:01:00Z",
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${THREAD_ID}-permission-load-forbidden`,
+    });
+
+    const permissionCard = await screen.findByTestId("permission-action-card");
+    await waitFor(() => {
+      expect(
+        within(permissionCard).getByText("Couldn't load permission status"),
+      ).toBeInTheDocument();
+    });
+    expect(
+      queryButtonByText("Failed to load permissions", permissionCard),
+    ).toBeNull();
+    expect(
+      queryButtonByText("Couldn't load permission status", permissionCard),
+    ).toBeNull();
+    expect(queryButtonByText("Confirm", permissionCard)).toBeNull();
+    expect(listRequests).toBe(1);
+  });
+
+  it("shows permission save failures outside the action button", async () => {
+    const user = userEvent.setup({ delay: null });
+    const permissionAuthorizeUrl = `https://app.vm0.ai/agents/${AGENT_ID}/permissions?ref=gmail&permission=messages.write&action=allow&expiresIn=1h`;
+    context.mocks.api(zeroUserPermissionGrantsContract.list, ({ respond }) => {
+      return respond(200, []);
+    });
+    context.mocks.api(zeroUserPermissionGrantsContract.apply, ({ respond }) => {
+      return respond(403, {
+        error: {
+          code: "FORBIDDEN",
+          message: "Forbidden",
+        },
+      });
+    });
+
+    mockChatLifecycle(context, {
+      threadId: `${THREAD_ID}-permission-save-error`,
+      threadTitle: "Permission save error",
+      chatMessages: [
+        {
+          id: "msg-user-permission-save-error",
+          role: "user",
+          content: "Allow Gmail message writes",
+          runId: "run-permission-save-error",
+          createdAt: "2026-06-09T11:00:00Z",
+        },
+        {
+          id: "msg-assistant-permission-save-error-card",
+          role: "assistant",
+          content: permissionAuthorizeUrl,
+          runId: "run-permission-save-error",
+          createdAt: "2026-06-09T11:01:00Z",
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${THREAD_ID}-permission-save-error`,
+    });
+
+    const permissionCard = await screen.findByTestId("permission-action-card");
+    await confirmPermissionAction(user, permissionCard);
+
+    await waitFor(() => {
+      expect(
+        within(permissionCard).getByText("Couldn't update permissions"),
+      ).toBeInTheDocument();
+    });
+    expect(
+      queryButtonByText("Couldn't update permissions", permissionCard),
+    ).toBeNull();
+    await waitForButtonByText("Confirm", permissionCard);
+    expect(
+      within(permissionCard).queryByText("Permissions updated"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(permissionCard).queryByText("Already allowed"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps permission success visible while permission grants reload", async () => {
+    mockNow();
+    const user = userEvent.setup({ delay: null });
+    const permissionAuthorizeUrl = `https://app.vm0.ai/agents/${AGENT_ID}/permissions?ref=gmail&permission=messages.write&action=allow&expiresIn=1h`;
+    let listRequests = 0;
+    let storedGrants: UserPermissionGrantResponse[] = [];
+    let resolveReload: () => void = () => {
+      throw new Error("Permission grant reload request did not start");
+    };
+    context.mocks.api(
+      zeroUserPermissionGrantsContract.list,
+      async ({ deferred, respond }) => {
+        listRequests += 1;
+        if (listRequests === 1) {
+          return respond(200, []);
+        }
+        if (listRequests === 2) {
+          const reloadDeferred = deferred<void>();
+          resolveReload = () => {
+            reloadDeferred.resolve();
+          };
+          await reloadDeferred.promise;
+        }
+        return respond(200, storedGrants);
+      },
+    );
+    context.mocks.api(
+      zeroUserPermissionGrantsContract.apply,
+      ({ body, respond }) => {
+        const grant = body.grants[0];
+        if (!grant) {
+          throw new Error("Expected a permission grant");
+        }
+        storedGrants = [
+          {
+            agentId: body.agentId,
+            connectorRef: body.connectorRef,
+            permission: grant.permission,
+            action: grant.action,
+            expiresAt: isoFromNowMs(60 * 60 * 1000),
+            createdAt: "2026-06-09T11:00:00Z",
+            updatedAt: "2026-06-09T11:01:00Z",
+          },
+        ];
+        return respond(200, storedGrants);
+      },
+    );
+
+    mockChatLifecycle(context, {
+      threadId: `${THREAD_ID}-permission-save-reload`,
+      threadTitle: "Permission save reload",
+      chatMessages: [
+        {
+          id: "msg-user-permission-save-reload",
+          role: "user",
+          content: "Allow Gmail message writes",
+          runId: "run-permission-save-reload",
+          createdAt: "2026-06-09T11:00:00Z",
+        },
+        {
+          id: "msg-assistant-permission-save-reload-card",
+          role: "assistant",
+          content: permissionAuthorizeUrl,
+          runId: "run-permission-save-reload",
+          createdAt: "2026-06-09T11:01:00Z",
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${THREAD_ID}-permission-save-reload`,
+    });
+
+    const permissionCard = await screen.findByTestId("permission-action-card");
+    await confirmPermissionAction(user, permissionCard);
+
+    await waitFor(() => {
+      expect(listRequests).toBe(2);
+    });
+    expect(
+      within(permissionCard).getByText("Permissions updated"),
+    ).toBeInTheDocument();
+    expect(
+      within(permissionCard).queryByText("Checking permission status..."),
+    ).not.toBeInTheDocument();
+
+    resolveReload();
+    await waitFor(() => {
+      expect(
+        within(permissionCard).getByText("Permissions updated"),
+      ).toBeInTheDocument();
+    });
+  });
+
+  it("lets users change permission duration before confirming", async () => {
+    mockNow();
+    const user = userEvent.setup({ delay: null });
+    const permissionAuthorizeUrl = `https://app.vm0.ai/agents/${AGENT_ID}/permissions?ref=slack&permission=admin.analytics%3Aread&action=allow&expiresIn=24h`;
+    let capturedBody: unknown = null;
+    context.mocks.api(zeroUserPermissionGrantsContract.list, ({ respond }) => {
+      return respond(200, []);
+    });
+    context.mocks.api(
+      zeroUserPermissionGrantsContract.apply,
+      ({ body, respond }) => {
+        const grant = body.grants[0];
+        if (!grant) {
+          throw new Error("Expected a permission grant");
+        }
+        capturedBody = body;
+        return respond(200, [
+          {
+            agentId: body.agentId,
+            connectorRef: body.connectorRef,
+            permission: grant.permission,
+            action: grant.action,
+            expiresAt: isoFromNowMs(7 * 24 * 60 * 60 * 1000),
+            createdAt: "2026-06-09T11:00:00Z",
+            updatedAt: "2026-06-09T11:01:00Z",
+          },
+        ]);
+      },
+    );
+    mockChatLifecycle(context, {
+      threadId: `${THREAD_ID}-duration`,
+      threadTitle: "Permission duration",
+      chatMessages: [
+        {
+          id: "msg-user-permission-duration-request",
+          role: "user",
+          content: "Allow Slack analytics for a week",
+          runId: "run-permission-duration",
+          createdAt: "2026-06-09T11:00:00Z",
+        },
+        {
+          id: "msg-assistant-permission-duration-card",
+          role: "assistant",
+          content: permissionAuthorizeUrl,
+          runId: "run-permission-duration",
+          createdAt: "2026-06-09T11:01:00Z",
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${THREAD_ID}-duration`,
+    });
+
+    const permissionCard = await screen.findByTestId("permission-action-card");
+    await waitForButtonByText("Confirm", permissionCard);
+    await user.click(
+      within(permissionCard).getByLabelText("Permission duration"),
+    );
+    await user.click(await screen.findByText("7 days"));
+
+    await waitFor(() => {
+      expect(within(permissionCard).getByText("7 days")).toBeInTheDocument();
+    });
+
+    await confirmPermissionAction(user, permissionCard);
+
+    await waitFor(() => {
+      expect(
+        within(permissionCard).getByText("Permissions updated"),
+      ).toBeInTheDocument();
+      expect(capturedBody).toMatchObject({
+        agentId: AGENT_ID,
+        connectorRef: "slack",
+        mode: "patch",
+        grants: [
+          {
+            permission: "admin.analytics:read",
+            action: "allow",
+            expiresIn: "7d",
+          },
+        ],
+      });
+    });
+  });
+
+  it("lets users confirm unknown endpoint permissions from assistant messages", async () => {
+    mockNow();
+    const user = userEvent.setup({ delay: null });
+    const permissionAuthorizeUrl = `https://app.vm0.ai/agents/${AGENT_ID}/permissions?ref=cloudflare&permission=${UNKNOWN_PERMISSION_GRANT}&action=allow&expiresIn=1h`;
+    let capturedBody: unknown = null;
+    context.mocks.api(zeroUserPermissionGrantsContract.list, ({ respond }) => {
+      return respond(200, []);
+    });
+    context.mocks.api(
+      zeroUserPermissionGrantsContract.apply,
+      ({ body, respond }) => {
+        const grant = body.grants[0];
+        if (!grant) {
+          throw new Error("Expected a permission grant");
+        }
+        capturedBody = body;
+        return respond(200, [
+          {
+            agentId: body.agentId,
+            connectorRef: body.connectorRef,
+            permission: grant.permission,
+            action: grant.action,
+            expiresAt: isoFromNowMs(60 * 60 * 1000),
+            createdAt: "2026-06-09T11:00:00Z",
+            updatedAt: "2026-06-09T11:01:00Z",
+          },
+        ]);
+      },
+    );
+    mockChatLifecycle(context, {
+      threadId: `${THREAD_ID}-unknown-permission`,
+      threadTitle: "Unknown permission",
+      chatMessages: [
+        {
+          id: "msg-user-unknown-permission-request",
+          role: "user",
+          content: "Allow the Cloudflare request",
+          runId: "run-unknown-permission",
+          createdAt: "2026-06-09T11:00:00Z",
+        },
+        {
+          id: "msg-assistant-unknown-permission-card",
+          role: "assistant",
+          content: permissionAuthorizeUrl,
+          runId: "run-unknown-permission",
+          createdAt: "2026-06-09T11:01:00Z",
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${THREAD_ID}-unknown-permission`,
+    });
+
+    const permissionCard = await screen.findByTestId("permission-action-card");
+    await waitFor(() => {
+      expect(
+        within(permissionCard).getByText("Cloudflare permissions"),
+      ).toBeInTheDocument();
+      expect(
+        within(permissionCard).getByText(`Allow ${UNKNOWN_PERMISSION_GRANT}`),
+      ).toBeInTheDocument();
+    });
+
+    await confirmPermissionAction(user, permissionCard);
+
+    await waitFor(() => {
+      expect(
+        within(permissionCard).getByText("Permissions updated"),
+      ).toBeInTheDocument();
+      expect(capturedBody).toMatchObject({
+        agentId: AGENT_ID,
+        connectorRef: "cloudflare",
+        mode: "patch",
+        grants: [
+          {
+            permission: UNKNOWN_PERMISSION_GRANT,
+            action: "allow",
+            expiresIn: "1h",
+          },
+        ],
+      });
+    });
+  });
+
+  it("lets users deny a permission request from an assistant message", async () => {
+    const user = userEvent.setup({ delay: null });
+    const permissionDenyUrl = `https://app.vm0.ai/agents/${AGENT_ID}/permissions?ref=slack&permission=admin.analytics%3Aread&action=deny`;
+    let grants: UserPermissionGrantResponse[] = [
+      {
+        agentId: AGENT_ID,
+        connectorRef: "slack",
+        permission: "admin.analytics:read",
+        action: "allow",
+        expiresAt: null,
+        createdAt: "2026-06-09T10:30:00Z",
+        updatedAt: "2026-06-09T10:30:00Z",
+      },
+    ];
+    context.mocks.api(zeroUserPermissionGrantsContract.list, ({ respond }) => {
+      return respond(200, grants);
+    });
+    context.mocks.api(
+      zeroUserPermissionGrantsContract.apply,
+      ({ body, respond }) => {
+        const appliedGrant = body.grants[0];
+        if (!appliedGrant) {
+          throw new Error("Expected a permission grant");
+        }
+        expect(body.mode).toBe("patch");
+        const grant: UserPermissionGrantResponse = {
+          agentId: body.agentId,
+          connectorRef: body.connectorRef,
+          permission: appliedGrant.permission,
+          action: appliedGrant.action,
+          expiresAt: null,
+          createdAt: grants[0]?.createdAt ?? "2026-06-09T10:30:00Z",
+          updatedAt: "2026-06-09T11:02:00Z",
+        };
+        grants = [grant];
+        return respond(200, [grant]);
+      },
+    );
+
+    mockChatLifecycle(context, {
+      threadId: `${THREAD_ID}-deny`,
+      threadTitle: "Permission action",
+      chatMessages: [
+        {
+          id: "msg-user-permission-deny-request",
+          role: "user",
+          content: "Block Slack analytics access",
+          runId: "run-permission-deny",
+          createdAt: "2026-06-09T11:00:00Z",
+        },
+        {
+          id: "msg-assistant-permission-deny-card",
+          role: "assistant",
+          content: permissionDenyUrl,
+          runId: "run-permission-deny",
+          createdAt: "2026-06-09T11:01:00Z",
+        },
+      ],
+    });
+
+    detachedSetupPage({
+      context,
+      path: `/chats/${THREAD_ID}-deny`,
+    });
+
+    const permissionCard = await screen.findByTestId("permission-action-card");
+    await waitFor(() => {
+      expect(
+        within(permissionCard).getByText("Slack permissions"),
+      ).toBeInTheDocument();
+      expect(
+        within(permissionCard).getByText("Deny admin.analytics:read"),
+      ).toBeInTheDocument();
+    });
+
+    await confirmPermissionAction(user, permissionCard);
+
+    await waitFor(() => {
+      expect(
+        within(permissionCard).getByText("Permission denied"),
+      ).toBeInTheDocument();
+    });
+  });
+});

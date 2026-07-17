@@ -1,0 +1,365 @@
+import { command, computed, state } from "ccstate";
+import { localStorageSignals } from "../external/local-storage.ts";
+import { reloadAgents$ } from "../agent.ts";
+
+// ---------------------------------------------------------------------------
+// Chat list dialog search query
+// ---------------------------------------------------------------------------
+const internalChatListQuery$ = state("");
+export const chatListQuery$ = computed((get) => {
+  return get(internalChatListQuery$);
+});
+export const setChatListQuery$ = command(({ set }, query: string) => {
+  set(internalChatListQuery$, query);
+});
+
+// ---------------------------------------------------------------------------
+// Delete confirmation dialog state (RecentChatList)
+// ---------------------------------------------------------------------------
+const internalPendingDeleteThreadId$ = state<string | null>(null);
+export const pendingDeleteThreadId$ = computed((get) => {
+  return get(internalPendingDeleteThreadId$);
+});
+export const setPendingDeleteThreadId$ = command(
+  ({ set }, id: string | null) => {
+    set(internalPendingDeleteThreadId$, id);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Rename dialog state (RecentChatList)
+// ---------------------------------------------------------------------------
+const internalRenameDialogThreadId$ = state<string | null>(null);
+export const renameDialogThreadId$ = computed((get) => {
+  return get(internalRenameDialogThreadId$);
+});
+export const setRenameDialogThreadId$ = command(
+  ({ set }, id: string | null) => {
+    set(internalRenameDialogThreadId$, id);
+  },
+);
+
+const internalRenameDialogAgentId$ = state<string | null>(null);
+export const renameDialogAgentId$ = computed((get) => {
+  return get(internalRenameDialogAgentId$);
+});
+export const setRenameDialogAgentId$ = command(({ set }, id: string | null) => {
+  set(internalRenameDialogAgentId$, id);
+});
+
+const internalRenameDialogInput$ = state("");
+export const renameDialogInput$ = computed((get) => {
+  return get(internalRenameDialogInput$);
+});
+export const setRenameDialogInput$ = command(({ set }, input: string) => {
+  set(internalRenameDialogInput$, input);
+});
+
+export const openRenameChatThreadDialog$ = command(
+  (
+    { set },
+    {
+      threadId,
+      title,
+      agentId,
+    }: {
+      threadId: string;
+      title: string | null | undefined;
+      agentId?: string | null | undefined;
+    },
+  ) => {
+    set(internalRenameDialogInput$, title?.trim() ?? "");
+    set(internalRenameDialogAgentId$, agentId?.trim() || null);
+    set(internalRenameDialogThreadId$, threadId);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Emoji picker menu state (chat header)
+// ---------------------------------------------------------------------------
+const internalEmojiMenuThreadId$ = state<string | null>(null);
+export const emojiMenuThreadId$ = computed((get) => {
+  return get(internalEmojiMenuThreadId$);
+});
+
+const internalEmojiMenuTitle$ = state<string | null>(null);
+export const emojiMenuTitle$ = computed((get) => {
+  return get(internalEmojiMenuTitle$);
+});
+
+export const openChatThreadEmojiMenu$ = command(
+  (
+    { set },
+    { threadId, title }: { threadId: string; title: string | null | undefined },
+  ) => {
+    set(internalEmojiMenuTitle$, title?.trim() || null);
+    set(internalEmojiMenuThreadId$, threadId);
+  },
+);
+
+export const closeChatThreadEmojiMenu$ = command(({ set }) => {
+  set(internalEmojiMenuThreadId$, null);
+  set(internalEmojiMenuTitle$, null);
+});
+
+// ---------------------------------------------------------------------------
+// Session list collapse state (RecentChatSection) — persisted in localStorage
+// ---------------------------------------------------------------------------
+const {
+  get$: sessionListCollapsedRaw$,
+  set$: setSessionListCollapsedRaw$,
+  clear$: clearSessionListCollapsed$,
+} = localStorageSignals("sessionListCollapsed");
+export const sessionListCollapsed$ = computed((get) => {
+  return get(sessionListCollapsedRaw$) !== null;
+});
+export const setSessionListCollapsed$ = command(
+  ({ set }, collapsed: boolean) => {
+    if (collapsed) {
+      set(setSessionListCollapsedRaw$, "1");
+    } else {
+      set(clearSessionListCollapsed$);
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Manage section collapse state (ZeroSidebar) — persisted in localStorage
+// ---------------------------------------------------------------------------
+const {
+  get$: manageSectionCollapsedRaw$,
+  set$: setManageSectionCollapsedRaw$,
+  clear$: clearManageSectionCollapsed$,
+} = localStorageSignals("manageCollapsed");
+export const manageSectionCollapsed$ = computed((get) => {
+  return get(manageSectionCollapsedRaw$) !== null;
+});
+export const setManageSectionCollapsed$ = command(
+  ({ set }, collapsed: boolean) => {
+    if (collapsed) {
+      set(setManageSectionCollapsedRaw$, "1");
+    } else {
+      set(clearManageSectionCollapsed$);
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Chat list dialog state (TalkToSection)
+// ---------------------------------------------------------------------------
+const internalChatListOpen$ = state(false);
+export const chatListOpen$ = computed((get) => {
+  return get(internalChatListOpen$);
+});
+export const setChatListOpen$ = command(({ set }, open: boolean) => {
+  set(internalChatListOpen$, open);
+});
+
+export const openAgentListDialog$ = command(({ set }) => {
+  set(internalChatListQuery$, "");
+  set(internalChatListOpen$, true);
+  set(reloadAgents$);
+});
+
+// ---------------------------------------------------------------------------
+// Agent card / pinned section collapse state (TalkToSection) — persisted in localStorage
+// ---------------------------------------------------------------------------
+const {
+  get$: agentCardCollapsedRaw$,
+  set$: setAgentCardCollapsedRaw$,
+  clear$: clearAgentCardCollapsed$,
+} = localStorageSignals("pinnedCollapsed");
+export const agentCardCollapsed$ = computed((get) => {
+  return get(agentCardCollapsedRaw$) !== null;
+});
+export const setAgentCardCollapsed$ = command(({ set }, collapsed: boolean) => {
+  if (collapsed) {
+    set(setAgentCardCollapsedRaw$, "1");
+  } else {
+    set(clearAgentCardCollapsed$);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Custom scrollbar thumb style (OverlayScrollArea)
+// ---------------------------------------------------------------------------
+interface ThumbStyle {
+  top: number;
+  height: number;
+  visible: boolean;
+}
+const internalThumbStyle$ = state<ThumbStyle>({
+  top: 0,
+  height: 0,
+  visible: false,
+});
+export const thumbStyle$ = computed((get) => {
+  return get(internalThumbStyle$);
+});
+export const setThumbStyle$ = command(({ set }, style: ThumbStyle) => {
+  set(internalThumbStyle$, style);
+});
+
+// ---------------------------------------------------------------------------
+// Scrollbar hover state (OverlayScrollArea)
+// ---------------------------------------------------------------------------
+const internalHovering$ = state(false);
+export const hovering$ = computed((get) => {
+  return get(internalHovering$);
+});
+export const setHovering$ = command(({ set }, hovering: boolean) => {
+  set(internalHovering$, hovering);
+});
+
+// ---------------------------------------------------------------------------
+// Overlay scroll viewport (OverlayScrollArea)
+// ---------------------------------------------------------------------------
+const internalOverlayScrollViewport$ = state<HTMLElement | null>(null);
+interface OverlayScrollMetrics {
+  scrollTop: number;
+  scrollHeight: number;
+  clientHeight: number;
+}
+
+const internalOverlayScrollMetrics$ = state<OverlayScrollMetrics>(
+  emptyOverlayScrollMetrics(),
+);
+
+function emptyOverlayScrollMetrics(): OverlayScrollMetrics {
+  return {
+    scrollTop: 0,
+    scrollHeight: 0,
+    clientHeight: 0,
+  };
+}
+
+export const overlayScrollViewport$ = computed((get) => {
+  return get(internalOverlayScrollViewport$);
+});
+export const overlayScrollMetrics$ = computed((get) => {
+  return get(internalOverlayScrollMetrics$);
+});
+export const setOverlayScrollViewport$ = command(
+  ({ set }, viewport: HTMLElement | null) => {
+    set(internalOverlayScrollViewport$, viewport);
+    set(
+      internalOverlayScrollMetrics$,
+      viewport
+        ? {
+            scrollTop: viewport.scrollTop,
+            scrollHeight: viewport.scrollHeight,
+            clientHeight: viewport.clientHeight,
+          }
+        : emptyOverlayScrollMetrics(),
+    );
+  },
+);
+export const setOverlayScrollMetrics$ = command(
+  ({ set }, metrics: OverlayScrollMetrics) => {
+    set(internalOverlayScrollMetrics$, metrics);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Chat thread virtual list DOM state (RecentChatSection)
+// ---------------------------------------------------------------------------
+export const CHAT_THREAD_VIRTUAL_ROW_HEIGHT = 36;
+export const CHAT_THREAD_VIRTUAL_FALLBACK_VIEWPORT_HEIGHT =
+  CHAT_THREAD_VIRTUAL_ROW_HEIGHT * 12;
+const internalChatThreadVirtualListElement$ = state<HTMLElement | null>(null);
+export type ChatThreadVirtualListScrollAlign = "top" | "bottom";
+
+function hasUsableLayoutPosition(rect: DOMRectReadOnly): boolean {
+  return rect.top !== 0 || rect.left !== 0;
+}
+
+export function getChatThreadVirtualListScrollMargin(
+  scrollViewport: HTMLElement | null,
+  virtualListElement: HTMLElement | null,
+): number {
+  if (!scrollViewport || !virtualListElement) {
+    return 0;
+  }
+
+  const viewportRect = scrollViewport.getBoundingClientRect();
+  const virtualListRect = virtualListElement.getBoundingClientRect();
+  if (
+    hasUsableLayoutPosition(viewportRect) ||
+    hasUsableLayoutPosition(virtualListRect)
+  ) {
+    return Math.max(
+      0,
+      scrollViewport.scrollTop + virtualListRect.top - viewportRect.top,
+    );
+  }
+
+  return Math.max(0, virtualListElement.offsetTop - scrollViewport.offsetTop);
+}
+
+export const chatThreadVirtualListElement$ = computed((get) => {
+  return get(internalChatThreadVirtualListElement$);
+});
+export const setChatThreadVirtualListElement$ = command(
+  ({ set }, element: HTMLElement | null) => {
+    set(internalChatThreadVirtualListElement$, element);
+  },
+);
+export const scrollChatThreadVirtualListToIndex$ = command(
+  (
+    { get, set },
+    index: number,
+    align: ChatThreadVirtualListScrollAlign = "top",
+  ): boolean => {
+    if (!Number.isInteger(index) || index < 0) {
+      return false;
+    }
+
+    const scrollViewport = get(internalOverlayScrollViewport$);
+    const virtualListElement = get(internalChatThreadVirtualListElement$);
+    if (!scrollViewport || !virtualListElement) {
+      return false;
+    }
+
+    const currentMetrics = get(internalOverlayScrollMetrics$);
+    const scrollMargin = getChatThreadVirtualListScrollMargin(
+      scrollViewport,
+      virtualListElement,
+    );
+    const viewportHeight =
+      currentMetrics.clientHeight ||
+      scrollViewport.clientHeight ||
+      CHAT_THREAD_VIRTUAL_FALLBACK_VIEWPORT_HEIGHT;
+    const rowTop = scrollMargin + index * CHAT_THREAD_VIRTUAL_ROW_HEIGHT;
+    const rowBottom = rowTop + CHAT_THREAD_VIRTUAL_ROW_HEIGHT;
+    const viewportTop = scrollViewport.scrollTop;
+    const viewportBottom = viewportTop + viewportHeight;
+    let nextScrollTop = viewportTop;
+    if (rowBottom > viewportBottom) {
+      nextScrollTop =
+        align === "bottom"
+          ? Math.max(0, rowBottom - viewportHeight)
+          : Math.max(0, rowTop);
+    } else if (rowTop < viewportTop) {
+      nextScrollTop = Math.max(0, rowTop);
+    }
+
+    scrollViewport.scrollTop = nextScrollTop;
+    set(internalOverlayScrollMetrics$, {
+      scrollTop: nextScrollTop,
+      scrollHeight: scrollViewport.scrollHeight,
+      clientHeight: scrollViewport.clientHeight,
+    });
+    return true;
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Main sidebar scroll tracking (ZeroSidebar)
+// ---------------------------------------------------------------------------
+const internalIsScrolled$ = state(false);
+export const isScrolled$ = computed((get) => {
+  return get(internalIsScrolled$);
+});
+export const setIsScrolled$ = command(({ set }, scrolled: boolean) => {
+  set(internalIsScrolled$, scrolled);
+});
