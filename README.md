@@ -1,30 +1,30 @@
 # AgentMonitor
 
-AgentMonitor is a full-stack platform for executing, observing, and operating AI agents in isolated runtimes. The repository combines a React control plane, a TypeScript API and CLI, an Electron desktop shell, a Rust sandbox runner, infrastructure automation, and end-to-end validation.
+AgentMonitor 是一个用于在隔离运行时中执行、观测和运维 AI Agent 的全栈平台。仓库包含 React 控制平面、TypeScript API 与 CLI、Electron 桌面端、Rust 沙箱运行器、基础设施自动化以及端到端验证。
 
-## Core capabilities
+## 核心能力
 
-- Submit, resume, cancel, and inspect long-running agent workflows.
-- Stream run events, logs, checkpoints, artifacts, and usage telemetry.
-- Execute agents in isolated sandboxes with explicit process-control and filesystem boundaries.
-- Manage model providers, secrets, connectors, schedules, workflows, and hosted artifacts.
-- Operate through a web application, CLI, desktop shell, and API.
-- Collect application traces and host metrics through OpenTelemetry-compatible services and Grafana Alloy provisioning.
-- Validate runtime behavior with TypeScript, Rust, Playwright, and Bats test suites.
+- 提交、恢复、取消和检查长时间运行的 Agent 工作流。
+- 实时传输运行事件、日志、检查点、产物和用量遥测数据。
+- 在隔离沙箱中执行 Agent，并明确限制进程控制和文件系统访问边界。
+- 管理模型提供方、密钥、连接器、定时任务、工作流和托管产物。
+- 通过 Web 应用、CLI、桌面端和 API 操作平台。
+- 通过兼容 OpenTelemetry 的服务和 Grafana Alloy 配置采集应用链路与主机指标。
+- 使用 TypeScript、Rust、Playwright 和 Bats 测试套件验证运行时行为。
 
-## System design
+## 系统设计
 
 ```mermaid
 flowchart TB
-    WEB["React web application"]
-    DESKTOP["Electron desktop shell"]
+    WEB["React Web 应用"]
+    DESKTOP["Electron 桌面端"]
     CLI["Agent CLI"]
     API["TypeScript API"]
-    DB["PostgreSQL and object storage"]
-    EVENTS["Realtime events and telemetry"]
-    RUNNER["Rust runner"]
-    SANDBOX["Isolated agent sandbox"]
-    OBS["Logs, traces, metrics, and alerts"]
+    DB["PostgreSQL 与对象存储"]
+    EVENTS["实时事件与遥测数据"]
+    RUNNER["Rust 运行器"]
+    SANDBOX["隔离 Agent 沙箱"]
+    OBS["日志、链路、指标与告警"]
 
     WEB --> API
     DESKTOP --> API
@@ -37,43 +37,43 @@ flowchart TB
     RUNNER --> OBS
 ```
 
-## Repository layout
+## 仓库结构
 
 ```text
 AgentMonitor/
 ├── turbo/
-│   ├── apps/api/            Hono-based API and background services
-│   ├── apps/cli/            Agent and platform command-line interfaces
-│   ├── apps/desktop/        Electron desktop and computer-use shell
-│   ├── apps/host-worker/    Hosted-site worker
-│   ├── apps/platform/       React and Vite control plane
-│   └── packages/            Shared contracts, connectors, database, core, and UI
-├── crates/                  Rust runner, sandbox, guest, IPC, and vsock crates
-├── ansible/                 Runner deployment and monitoring automation
-├── e2e/                     Bats and Playwright end-to-end tests
-├── docker/                  Development and CI toolchain images
-└── scripts/                 Local development and infrastructure utilities
+│   ├── apps/api/            基于 Hono 的 API 与后台服务
+│   ├── apps/cli/            Agent 与平台命令行界面
+│   ├── apps/desktop/        Electron 桌面端与 computer-use shell
+│   ├── apps/host-worker/    托管站点 Worker
+│   ├── apps/platform/       React 与 Vite 控制平面
+│   └── packages/            共享协议、连接器、数据库、核心逻辑与 UI
+├── crates/                  Rust 运行器、沙箱、guest、IPC 与 vsock crate
+├── ansible/                 运行器部署与监控自动化
+├── e2e/                     Bats 与 Playwright 端到端测试
+├── docker/                  开发与 CI 工具链镜像
+└── scripts/                 本地开发与基础设施工具
 ```
 
-## Prerequisites
+## 运行条件
 
-The web and API workspace requires:
+Web 与 API 工作区需要：
 
 - Node.js `>=22.19`
-- pnpm `10.33.4` through Corepack
-- PostgreSQL and any external services enabled in the selected configuration
+- 通过 Corepack 使用 pnpm `10.33.4`
+- PostgreSQL，以及所选配置中启用的外部服务
 
-The runner workspace additionally requires:
+运行器工作区还需要：
 
-- Rust with Edition 2024 support
-- Linux for Firecracker-based sandbox execution
-- Docker for image and integration workflows
+- 支持 Edition 2024 的 Rust
+- 使用 Linux 运行基于 Firecracker 的沙箱
+- 使用 Docker 完成镜像和集成工作流
 
-Windows can run repository inspection and much of the TypeScript toolchain, but the low-level runner and several Bash workflows require Linux or WSL 2.
+Windows 可用于查看仓库和运行大部分 TypeScript 工具链，但底层运行器和部分 Bash 工作流需要 Linux 或 WSL 2。
 
-## TypeScript workspace
+## TypeScript 工作区
 
-Install the locked dependency graph:
+按照锁定的依赖版本安装：
 
 ```powershell
 cd turbo
@@ -81,25 +81,25 @@ corepack enable
 corepack pnpm install --frozen-lockfile
 ```
 
-Environment configuration is app-specific:
+环境配置按应用分别管理：
 
-- `turbo/apps/platform/.env.example` documents the browser-facing variables.
-- `turbo/apps/platform/.env.local.tpl` and `turbo/apps/api/.env.local.tpl` use secret-manager references for local injection.
-- Local resolved values belong in `.env.local`, which is ignored by Git.
+- `turbo/apps/platform/.env.example` 记录浏览器端所需的环境变量。
+- `turbo/apps/platform/.env.local.tpl` 和 `turbo/apps/api/.env.local.tpl` 使用密钥管理器引用，在本地注入配置。
+- 解析后的本地配置应写入 `.env.local`；该文件已被 Git 忽略。
 
-Start components independently when working on a focused area:
+开发单个模块时，可以分别启动对应组件：
 
 ```powershell
-# Web application: http://localhost:3002
+# Web 应用：http://localhost:3002
 corepack pnpm --filter @vm0/app dev
 
-# API: http://localhost:3001
+# API：http://localhost:3001
 corepack pnpm --filter api start
 ```
 
-The aggregate `pnpm dev` workflow also starts development tunnel and integration helpers. It requires the corresponding external credentials and command-line tools.
+统一的 `pnpm dev` 工作流还会启动开发隧道和集成辅助工具，因此需要相应的外部凭据和命令行工具。
 
-## Rust runner workspace
+## Rust 运行器工作区
 
 ```bash
 cd crates
@@ -107,20 +107,20 @@ cargo check --workspace
 cargo test --workspace
 ```
 
-The runner is split into reusable crates for sandbox lifecycle, guest initialization, artifact transfer, process-control IPC, copy-on-write storage, and host/guest vsock transport.
+运行器由多个可复用 crate 组成，分别处理沙箱生命周期、guest 初始化、产物传输、进程控制 IPC、写时复制存储以及 host/guest vsock 通信。
 
-## Observability
+## 可观测性
 
-AgentMonitor records operational signals across the control plane and runtime:
+AgentMonitor 在控制平面和运行时两侧记录运维信号：
 
-- API tracing through OpenTelemetry instrumentation.
-- Error reporting integrations for API and desktop processes.
-- Searchable run logs and lifecycle telemetry.
-- Host-level collection through `ansible/playbooks/provision-monitoring.yml`.
-- Grafana Alloy configuration for system metrics and textfile collector output.
-- Watchdog and health-check coverage in runtime and end-to-end tests.
+- 通过 OpenTelemetry 插桩采集 API 链路。
+- 为 API 和桌面端进程接入错误上报。
+- 提供可检索的运行日志和生命周期遥测数据。
+- 通过 `ansible/playbooks/provision-monitoring.yml` 采集主机级数据。
+- 使用 Grafana Alloy 配置采集系统指标和 textfile collector 输出。
+- 通过运行时测试和端到端测试覆盖 watchdog 与健康检查。
 
-## Validation
+## 验证
 
 ### TypeScript
 
@@ -131,7 +131,7 @@ corepack pnpm check-types
 corepack pnpm test
 ```
 
-Targeted validation is available through workspace filters:
+可通过工作区过滤器进行定向验证：
 
 ```powershell
 corepack pnpm --filter @vm0/app test
@@ -148,14 +148,13 @@ cargo clippy --workspace --all-targets
 cargo test --workspace
 ```
 
-### End to end
+### 端到端测试
 
-The `e2e/` directory contains Bats suites for runner and platform behavior plus Playwright browser tests. These suites require a configured development stack and should be run from Linux or the project dev container.
+`e2e/` 目录包含验证运行器和平台行为的 Bats 测试套件，以及 Playwright 浏览器测试。运行这些测试需要配置好开发环境，并应在 Linux 或项目开发容器中执行。
 
-## Security and deployment notes
+## 安全与部署说明
 
-- Never commit resolved `.env.local` files, private keys, or generated connector credentials.
-- Secret template files contain secret-manager references, not resolved credentials.
-- Sandbox and runner changes should be validated on Linux because process isolation, namespaces, vsock, and Firecracker behavior cannot be verified from Windows alone.
-- Deployment, release, cleanup, and image workflows require repository-specific GitHub secrets and infrastructure. Review their inputs before enabling them in a new GitHub environment.
-
+- 不要提交已解析的 `.env.local` 文件、私钥或生成的连接器凭据。
+- 密钥模板文件中保存的是密钥管理器引用，而不是解析后的凭据。
+- 沙箱和运行器的改动应在 Linux 上验证，因为 Windows 无法验证进程隔离、namespace、vsock 和 Firecracker 的行为。
+- 部署、发布、清理和镜像工作流依赖仓库专用的 GitHub secrets 和基础设施。在新的 GitHub 环境中启用这些工作流前，应先检查其输入参数。
