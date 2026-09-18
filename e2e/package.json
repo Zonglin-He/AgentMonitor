@@ -16,7 +16,7 @@
   "dependencies": {
     "@clerk/testing": "^2.1.1",
     "@playwright/test": "^1.60.0",
-    "@types/node": "^25.9.3",
+    "@types/node": "^26.5.1",
     "dotenv": "^17.4.2"
   },
   "devDependencies": {
