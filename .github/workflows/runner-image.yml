@@ -33,7 +33,7 @@ jobs:
       runner-host-groups-matrix: ${{ steps.host-groups.outputs.matrix }}
       runner-host-groups-configured: ${{ steps.host-group-presence.outputs.configured }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
@@ -233,9 +233,9 @@ jobs:
       TARGET_TRIPLE: ${{ matrix.target }}
       PROFILE: vm0/default
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: mozilla-actions/sccache-action@v0.0.11
         with:
           version: "v0.15.0"
 
